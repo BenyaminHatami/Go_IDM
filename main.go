@@ -5,91 +5,183 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path"
+	"sync"
 	"time"
-
-	"github.com/schollz/progressbar/v3"
 )
 
-func downloadFile(url string) error {
+// DownloadTask represents a single download task
+type DownloadTask struct {
+	URL      string
+	FilePath string
+}
 
+// DownloadStatus represents the status of a download
+type DownloadStatus struct {
+	URL      string
+	Progress int
+	Speed    int
+	Error    error
+}
+
+// Constants
+const (
+	maxConcurrentDownloads = 3           // Limit to 3 concurrent downloads
+	bandwidthLimit         = 5000 * 1024 // 300 KB/s
+	tokenSize              = 1024        // 1 KB per token
+)
+
+// Global variables for progress tracking
+var (
+	progressMap = make(map[string]DownloadStatus) // Tracks progress of each download
+	progressMux = sync.Mutex{}                    // Mutex to protect progressMap
+)
+
+// Worker function to process download tasks
+func worker(id int, jobs <-chan DownloadTask, results chan<- DownloadStatus, tokenBucket <-chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for task := range jobs {
+		status := downloadFile(task.URL, task.FilePath, tokenBucket)
+		results <- status
+	}
+}
+
+// downloadFile downloads a file with throttling
+func downloadFile(url, filePath string, tokenBucket <-chan struct{}) DownloadStatus {
+	// Open the file for writing
+	file, err := os.Create(filePath)
+	if err != nil {
+		return DownloadStatus{URL: url, Error: err}
+	}
+	defer file.Close()
+
+	// Send an HTTP GET request
 	resp, err := http.Get(url)
 	if err != nil {
-		return fmt.Errorf("error making request: %v", err)
+		return DownloadStatus{URL: url, Error: err}
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
+	// Read the response body in chunks
+	buffer := make([]byte, tokenSize) // 1 KB buffer (matches token size)
+	totalBytes := resp.ContentLength
+	bytesDownloaded := 0
+	startTime := time.Now()
+
+	for {
+		<-tokenBucket // Acquire a token before downloading
+		n, err := resp.Body.Read(buffer)
+		if n > 0 {
+			file.Write(buffer[:n])
+			bytesDownloaded += n
+			// Calculate progress and speed
+			progress := int(float64(bytesDownloaded) / float64(totalBytes) * 100)
+			elapsed := time.Since(startTime).Seconds()
+			speed := int(float64(bytesDownloaded) / elapsed / 1024) // Speed in KB/s
+			// Update progress in the shared map
+			progressMux.Lock()
+			progressMap[filePath] = DownloadStatus{URL: url, Progress: progress, Speed: speed}
+			progressMux.Unlock()
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return DownloadStatus{URL: url, Error: err}
+		}
 	}
 
-	totalSize := resp.ContentLength
-	if totalSize <= 0 {
-		return fmt.Errorf("unknown file size")
+	return DownloadStatus{URL: url, Progress: 100, Speed: 0}
+}
+
+// progressBar generates a progress bar string
+func progressBar(progress int) string {
+	const width = 50
+	completed := progress * width / 100
+	bar := ""
+	for i := 0; i < width; i++ {
+		if i < completed {
+			bar += "="
+		} else {
+			bar += " "
+		}
 	}
+	return fmt.Sprintf("[%s]", bar)
+}
 
-	filename := path.Base(url)
-	if filename == "" || filename == "." || filename == "/" {
-		filename = "downloaded_file"
+// displayProgress updates the terminal with the progress of all downloads
+func displayProgress() {
+	for {
+		// Clear the terminal (optional, for better visualization)
+		fmt.Print("\033[H\033[2J")
+
+		// Print the progress of all downloads
+		progressMux.Lock()
+		for filePath, status := range progressMap {
+			fmt.Printf("Downloading %s: %s %d%% (%d KB/s)\n", filePath, progressBar(status.Progress), status.Progress, status.Speed)
+		}
+		progressMux.Unlock()
+
+		// Wait for a short time before updating again
+		time.Sleep(500 * time.Millisecond)
 	}
-
-	out, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("error creating file: %v", err)
-	}
-	defer out.Close()
-
-	bar := progressbar.NewOptions64(
-		totalSize,
-		progressbar.OptionSetWidth(30),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionShowCount(),
-		progressbar.OptionSetDescription(fmt.Sprintf("Downloading %s", filename)),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionShowElapsedTimeOnFinish(),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "=",
-			SaucerHead:    ">",
-			SaucerPadding: " ",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}),
-	)
-
-	start := time.Now()
-	multiWriter := io.MultiWriter(out, bar)
-
-	reader := io.TeeReader(resp.Body, multiWriter)
-
-	_, err = io.Copy(out, reader)
-	if err != nil {
-		return fmt.Errorf("error downloading file: %v", err)
-	}
-
-	bar.Finish()
-	fmt.Println()
-
-	elapsed := time.Since(start)
-	speed := float64(totalSize) / elapsed.Seconds() / 1024 // KB/s
-	fmt.Printf("Download completed in %v\n", elapsed.Round(time.Second))
-	fmt.Printf("Average speed: %.2f KB/s\n", speed)
-
-	return nil
 }
 
 func main() {
-	var url string
-	fmt.Println("Enter the URL of the file to download:")
-	fmt.Scanln(&url)
-
-	if url == "" {
-		fmt.Println("Please provide a valid URL")
-		return
+	// List of download tasks
+	downloadTasks := []DownloadTask{
+		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(320).mp3", FilePath: "1.mp3"},
+		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(320).mp3", FilePath: "file2.zip"},
+		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(320).mp3", FilePath: "file3.zip"},
+		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(320).mp3", FilePath: "file4.mp3"},
 	}
 
-	err := downloadFile(url)
-	if err != nil {
-		fmt.Println(err)
-		return
+	// Create channels for jobs and results
+	jobs := make(chan DownloadTask, len(downloadTasks))
+	results := make(chan DownloadStatus, len(downloadTasks))
+
+	// Create a token bucket for throttling
+	tokenBucket := make(chan struct{}, bandwidthLimit/tokenSize)
+
+	// Replenish tokens at a fixed rate (e.g., 300 KB/s)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		for range ticker.C {
+			for i := 0; i < bandwidthLimit/tokenSize; i++ {
+				tokenBucket <- struct{}{}
+			}
+		}
+	}()
+
+	// Start a fixed number of workers
+	var wg sync.WaitGroup
+	for w := 1; w <= maxConcurrentDownloads; w++ {
+		wg.Add(1)
+		go worker(w, jobs, results, tokenBucket, &wg)
 	}
+
+	// Add download tasks to the job queue
+	go func() {
+		for _, task := range downloadTasks {
+			jobs <- task
+		}
+		close(jobs)
+	}()
+
+	// Start the progress display
+	go displayProgress()
+
+	// Collect results
+	go func() {
+		for result := range results {
+			if result.Error != nil {
+				fmt.Printf("Download failed for %s: %v\n", result.URL, result.Error)
+			} else {
+				fmt.Printf("Download completed for %s\n", result.URL)
+			}
+		}
+	}()
+
+	// Wait for all workers to finish
+	wg.Wait()
+	close(results)
 }
