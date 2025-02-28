@@ -16,6 +16,7 @@ import (
 type DownloadTask struct {
 	URL      string
 	FilePath string
+	FileType string
 }
 
 // DownloadStatus represents the status of a download
@@ -31,7 +32,7 @@ const (
 	maxConcurrentDownloads = 3              // Limit to 3 concurrent downloads
 	bandwidthLimit         = 1000000 * 1024 // 300 KB/s
 	tokenSize              = 1024           // 1 KB per token
-	downloadDir            = "Downloads"    // Folder to save files
+	downloadDir            = "Downloads/"   // Folder to save files
 )
 
 // Global variables for progress tracking
@@ -44,20 +45,20 @@ var (
 func worker(id int, jobs <-chan DownloadTask, results chan<- DownloadStatus, tokenBucket <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for task := range jobs {
-		status := downloadFile(task.URL, task.FilePath, tokenBucket) // setting the deafault name
+		status := downloadFile(task.URL, task.FilePath, task.FileType, tokenBucket) // setting the deafault name
 		results <- status
 	}
 }
 
 // downloadFile downloads a file with throttling
-func downloadFile(url, filePath string, tokenBucket <-chan struct{}) DownloadStatus {
+func downloadFile(url, filePath string, fileType string, tokenBucket <-chan struct{}) DownloadStatus {
 	// Ensure Downloads directory exists
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+	if err := os.MkdirAll(downloadDir+fileType, 0755); err != nil {
 		return DownloadStatus{URL: url, Error: err}
 	}
 
 	// Full path includes Downloads folder
-	fullPath := filepath.Join(downloadDir, filePath)
+	fullPath := filepath.Join(downloadDir+fileType, filePath)
 
 	// Open the file for writing
 	file, err := os.Create(fullPath)
@@ -141,12 +142,13 @@ func displayProgress() {
 func main() {
 	// List of download tasks
 	downloadTasks := []DownloadTask{
-		{URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3", FilePath: ""},
-		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3", FilePath: ""},
-		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3", FilePath: ""},
-		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(320).mp3", FilePath: ""},
+		{URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
+		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
+		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
+		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(320).mp3"},
 	}
-	setFileNames(downloadTasks)
+	setFileNames(downloadTasks) // TODO should be in a better place!
+	setFileType(downloadTasks)  // TODO should be in a better place!
 
 	// Create channels for jobs and results
 	jobs := make(chan DownloadTask, len(downloadTasks))
@@ -207,14 +209,42 @@ func setFileNames(tasks []DownloadTask) {
 
 		if dt.FilePath == "" {
 			duplicates[dt.URL]++
+			temp := strings.Replace(path.Base(dt.URL), "%20", " ", -1)
 			if duplicates[dt.URL] == 1 {
-				temp := strings.Replace(path.Base(dt.URL), "%20", " ", -1)
 				tasks[v].FilePath = fmt.Sprintf("%s", temp)
 			} else {
-				temp := strings.Replace(path.Base(dt.URL), "%20", " ", -1)
 				temp1 := strings.LastIndex(temp, ".")
 				tasks[v].FilePath = fmt.Sprintf("%s (%d)%s", temp[0:temp1], duplicates[dt.URL]-1, temp[temp1:])
 			}
+
 		}
+
 	}
+}
+
+func setFileType(tasks []DownloadTask) {
+	for v, dt := range tasks {
+
+		temp2 := strings.LastIndex(dt.FilePath, ".")
+		s := fmt.Sprintf("%s", dt.FilePath[temp2+1:])
+
+		s = strings.ToLower(s)
+		if s == "mp3" || s == "wav" || s == "flac" || s == "aac" || s == "wma" {
+			tasks[v].FileType = "Music"
+		} else if s == "mov" || s == "avi" || s == "flac" || s == "mkv" || s == "mp4" {
+			tasks[v].FileType = "Video"
+		} else if s == "zip" || s == "rar" || s == "7z" {
+			tasks[v].FileType = "Compressed"
+		} else if s == "jpeg" || s == "jpg" || s == "png" {
+			tasks[v].FileType = "Pictures"
+		} else if s == "exe" || s == "msi" || s == "pkg" {
+			tasks[v].FileType = "Programs"
+		} else if s == "pdf" || s == "doc" || s == "txt" || s == "html" {
+			tasks[v].FileType = "Video"
+		} else {
+			tasks[v].FileType = "General"
+		}
+
+	}
+
 }
