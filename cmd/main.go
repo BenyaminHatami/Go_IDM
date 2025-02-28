@@ -71,6 +71,7 @@ func downloadFile(url string) error {
 
 	bar.Finish()
 	fmt.Println()
+	fmt.Println()
 
 	elapsed := time.Since(start)
 	speed := float64(totalSize) / elapsed.Seconds() / 1024 // KB/s
