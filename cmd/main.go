@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -21,18 +22,25 @@ type DownloadTask struct {
 
 // DownloadStatus represents the status of a download
 type DownloadStatus struct {
-	URL      string
-	Progress int
-	Speed    int
-	Error    error
+	URL           string
+	Progress      int
+	State         string // "running", "paused", "canceled", "completed"
+	Speed         int    // Speed in KB/s
+	BytesInWindow []int  // Bytes downloaded in recent window
+	Timestamps    []time.Time
+	Error         error
 }
 
 // Constants
 const (
-	maxConcurrentDownloads = 3              // Limit to 3 concurrent downloads
-	bandwidthLimit         = 1000000 * 1024 // 300 KB/s
-	tokenSize              = 1024           // 1 KB per token
-	downloadDir            = "Downloads/"   // Folder to save files
+	maxConcurrentDownloads = 3                     // Limit to 3 concurrent downloads
+	bandwidthLimit         = 300 * 1024            // 300 KB/s (in bytes)
+	tokenSize              = 1024                  // 1 KB per token
+	downloadDir            = "Downloads/"          // Folder to save files
+	windowDuration         = 1 * time.Second       // Rolling window for speed calculation
+	updateIntervalBytes    = 10 * 1024             // Update progressMap every 10 KB
+	updateIntervalTime     = 10 * time.Millisecond // Update progressMap every 100ms
+	refillInterval         = 10 * time.Millisecond // Refill token bucket every 10ms
 )
 
 // Global variables for progress tracking
@@ -41,17 +49,91 @@ var (
 	progressMux = sync.Mutex{}                    // Mutex to protect progressMap
 )
 
+// TokenBucket represents a token bucket system
+type TokenBucket struct {
+	mu             sync.Mutex
+	tokens         float64 // Current number of tokens
+	maxTokens      float64 // Maximum tokens (capacity)
+	refillRate     float64 // Tokens added per second (bytes/sec)
+	lastRefillTime time.Time
+	quit           chan struct{} // To stop the refill goroutine
+}
+
+// NewTokenBucket creates a new TokenBucket instance and starts the refill goroutine
+func NewTokenBucket(maxTokens float64, refillRate float64) *TokenBucket {
+	tb := &TokenBucket{
+		tokens:         maxTokens,
+		maxTokens:      maxTokens,
+		refillRate:     refillRate,
+		lastRefillTime: time.Now(),
+		quit:           make(chan struct{}),
+	}
+	// Start the refill goroutine
+	go tb.startRefill()
+	return tb
+}
+
+// startRefill runs a goroutine to periodically refill the token bucket
+func (tb *TokenBucket) startRefill() {
+	ticker := time.NewTicker(refillInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-tb.quit:
+			return
+		case <-ticker.C:
+			tb.mu.Lock()
+			now := time.Now()
+			duration := now.Sub(tb.lastRefillTime).Seconds()
+			tokensToAdd := tb.refillRate * duration
+			tb.tokens = math.Min(tb.tokens+tokensToAdd, tb.maxTokens)
+			tb.lastRefillTime = now
+			tb.mu.Unlock()
+		}
+	}
+}
+
+// Stop stops the refill goroutine
+func (tb *TokenBucket) Stop() {
+	close(tb.quit)
+}
+
+// Request checks if enough tokens are available and deducts them if so
+func (tb *TokenBucket) Request(tokens float64) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tokens <= tb.tokens {
+		tb.tokens -= tokens
+		return true
+	}
+	return false
+}
+
+// WaitForTokens waits until enough tokens are available
+func (tb *TokenBucket) WaitForTokens(tokens float64) {
+	for !tb.Request(tokens) {
+		// Calculate how long to wait based on the refill rate
+		tb.mu.Lock()
+		missingTokens := tokens - tb.tokens
+		waitSeconds := missingTokens / tb.refillRate
+		tb.mu.Unlock()
+		// Wait for the estimated time, but at least 1ms to avoid busy looping
+		waitDuration := time.Duration(math.Max(waitSeconds*float64(time.Second), float64(time.Millisecond)))
+		time.Sleep(waitDuration)
+	}
+}
+
 // Worker function to process download tasks
-func worker(id int, jobs <-chan DownloadTask, results chan<- DownloadStatus, tokenBucket <-chan struct{}, wg *sync.WaitGroup) {
+func worker(id int, jobs <-chan DownloadTask, results chan<- DownloadStatus, tokenBucket *TokenBucket, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for task := range jobs {
-		status := downloadFile(task.URL, task.FilePath, task.FileType, tokenBucket) // setting the deafault name
+		status := downloadFile(task.URL, task.FilePath, task.FileType, tokenBucket)
 		results <- status
 	}
 }
 
 // downloadFile downloads a file with throttling
-func downloadFile(url, filePath string, fileType string, tokenBucket <-chan struct{}) DownloadStatus {
+func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucket) DownloadStatus {
 	// Ensure Downloads directory exists
 	if err := os.MkdirAll(downloadDir+fileType, 0755); err != nil {
 		return DownloadStatus{URL: url, Error: err}
@@ -74,68 +156,166 @@ func downloadFile(url, filePath string, fileType string, tokenBucket <-chan stru
 	}
 	defer resp.Body.Close()
 
+	// Check server response
+	if resp.StatusCode != http.StatusOK {
+		return DownloadStatus{URL: url, Error: fmt.Errorf("bad status: %s", resp.Status)}
+	}
+
 	// Read the response body in chunks
 	buffer := make([]byte, tokenSize) // 1 KB buffer (matches token size)
 	totalBytes := resp.ContentLength
 	bytesDownloaded := 0
-	startTime := time.Now()
+	accumulatedBytes := 0 // For updating progressMap less frequently
+	lastUpdate := time.Now()
+
+	// Initialize status with window tracking
+	status := DownloadStatus{
+		URL:           url,
+		BytesInWindow: []int{},
+		Timestamps:    []time.Time{},
+	}
 
 	for {
-		<-tokenBucket // Acquire a token before downloading
+		// Wait for tokens before downloading
+		tokenBucket.WaitForTokens(tokenSize)
+
 		n, err := resp.Body.Read(buffer)
 		if n > 0 {
 			file.Write(buffer[:n])
 			bytesDownloaded += n
-			// Calculate progress and speed
+			accumulatedBytes += n
+
+			// Calculate progress
 			progress := int(float64(bytesDownloaded) / float64(totalBytes) * 100)
-			elapsed := time.Since(startTime).Seconds()
-			speed := int(float64(bytesDownloaded) / elapsed / 1024) // Speed in KB/s
-			// Update progress in the shared map
-			progressMux.Lock()
-			progressMap[filePath] = DownloadStatus{URL: url, Progress: progress, Speed: speed}
-			progressMux.Unlock()
+
+			// Update rolling window for speed calculation
+			now := time.Now()
+			status.BytesInWindow = append(status.BytesInWindow, n)
+			status.Timestamps = append(status.Timestamps, now)
+
+			// Remove entries outside the 1-second window
+			cutoff := now.Add(-windowDuration)
+			newBytes := []int{}
+			newTimes := []time.Time{}
+			for i, ts := range status.Timestamps {
+				if ts.After(cutoff) {
+					newBytes = append(newBytes, status.BytesInWindow[i])
+					newTimes = append(newTimes, ts)
+				}
+			}
+			status.BytesInWindow = newBytes
+			status.Timestamps = newTimes
+
+			// Calculate speed over the window
+			var totalBytesInWindow int
+			for _, b := range status.BytesInWindow {
+				totalBytesInWindow += b
+			}
+			var windowSeconds float64
+			if len(status.Timestamps) > 1 {
+				first := status.Timestamps[0]
+				last := status.Timestamps[len(status.Timestamps)-1]
+				windowSeconds = last.Sub(first).Seconds()
+			} else {
+				windowSeconds = time.Since(status.Timestamps[0]).Seconds()
+			}
+			var speed int
+			if windowSeconds > 0 {
+				speed = int(float64(totalBytesInWindow) / windowSeconds / 1024) // Speed in KB/s
+			} else {
+				speed = 0
+			}
+
+			// Update progressMap only if we've accumulated enough bytes or enough time has passed
+			if accumulatedBytes >= updateIntervalBytes || time.Since(lastUpdate) >= updateIntervalTime {
+				progressMux.Lock()
+				progressMap[filePath] = DownloadStatus{
+					URL:           url,
+					Progress:      progress,
+					Speed:         speed,
+					BytesInWindow: status.BytesInWindow,
+					Timestamps:    status.Timestamps,
+				}
+				progressMux.Unlock()
+				accumulatedBytes = 0
+				lastUpdate = now
+			}
 		}
 		if err != nil {
 			if err == io.EOF {
+				// TODO
 				break
 			}
 			return DownloadStatus{URL: url, Error: err}
 		}
 	}
 
-	return DownloadStatus{URL: url, Progress: 100, Speed: 0} // download finished!!
+	return DownloadStatus{URL: url, Progress: 100, Speed: 0}
 }
 
 // progressBar generates a progress bar string
 func progressBar(progress int) string {
-	const width = 100
+	const width = 40 // Matches the screenshot
 	completed := progress * width / 100
-	bar := ""
-	for i := 0; i < width; i++ {
-		if i < completed {
-			bar += "="
-		} else {
-			bar += " "
-		}
-	}
-	return fmt.Sprintf("[%s]", bar)
+	bar := strings.Repeat("=", completed) + strings.Repeat("-", width-completed)
+	return fmt.Sprintf("[%s] %d%%", bar, progress)
 }
 
 // displayProgress updates the terminal with the progress of all downloads
 func displayProgress() {
 	for {
-		// Clear the terminal (optional, for better visualization)
-		fmt.Print("\033[H\033[2J")
-
-		// Print the progress of all downloads
+		fmt.Print("\033[H\033[2J") // Clear the terminal
 		progressMux.Lock()
 		for filePath, status := range progressMap {
-			fmt.Printf("Downloading %s: %s %d%% (%d KB/s)\n", filePath, progressBar(status.Progress), status.Progress, status.Speed)
+			fmt.Printf("Downloading %s: %s (%d KB/s)\n", filePath, progressBar(status.Progress), status.Speed)
 		}
 		progressMux.Unlock()
+		time.Sleep(300 * time.Millisecond)
+	}
+}
 
-		// Wait for a short time before updating again
-		time.Sleep(500 * time.Millisecond)
+// setFileNames sets filenames based on URLs, handling duplicates
+func setFileNames(tasks []DownloadTask) {
+	duplicates := make(map[string]int)
+	for i, dt := range tasks {
+		if dt.FilePath == "" {
+			duplicates[dt.URL]++
+			temp := strings.Replace(path.Base(dt.URL), "%20", " ", -1)
+			if duplicates[dt.URL] == 1 {
+				tasks[i].FilePath = temp
+			} else {
+				temp1 := strings.LastIndex(temp, ".")
+				tasks[i].FilePath = fmt.Sprintf("%s (%d)%s", temp[:temp1], duplicates[dt.URL]-1, temp[temp1:])
+			}
+		}
+	}
+}
+
+// setFileType determines the file type based on extension
+func setFileType(tasks []DownloadTask) {
+	for i, dt := range tasks {
+		temp2 := strings.LastIndex(dt.FilePath, ".")
+		if temp2 == -1 {
+			tasks[i].FileType = "General"
+			continue
+		}
+		s := strings.ToLower(dt.FilePath[temp2+1:])
+		switch s {
+		case "mp3", "wav", "flac", "aac", "wma":
+			tasks[i].FileType = "Music"
+		case "mov", "avi", "mkv", "mp4":
+			tasks[i].FileType = "Video"
+		case "zip", "rar", "7z":
+			tasks[i].FileType = "Compressed"
+		case "jpeg", "jpg", "png":
+			tasks[i].FileType = "Pictures"
+		case "exe", "msi", "pkg":
+			tasks[i].FileType = "Programs"
+		case "pdf", "doc", "txt", "html":
+			tasks[i].FileType = "Documents"
+		default:
+			tasks[i].FileType = "General"
+		}
 	}
 }
 
@@ -143,29 +323,21 @@ func main() {
 	// List of download tasks
 	downloadTasks := []DownloadTask{
 		{URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
-		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
-		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
-		{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(320).mp3"},
+
+		{URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
+		{URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
+		//{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
 	}
-	setFileNames(downloadTasks) // TODO should be in a better place!
+	setFileNames(downloadTasks) // TODO should be in a better place! ya do ta ro bezae to ye tabe setType
 	setFileType(downloadTasks)  // TODO should be in a better place!
 
 	// Create channels for jobs and results
 	jobs := make(chan DownloadTask, len(downloadTasks))
 	results := make(chan DownloadStatus, len(downloadTasks))
 
-	// Create a token bucket for throttling
-	tokenBucket := make(chan struct{}, bandwidthLimit/tokenSize)
-
-	// Replenish tokens at a fixed rate (e.g., 300 KB/s)
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		for range ticker.C {
-			for i := 0; i < bandwidthLimit/tokenSize; i++ {
-				tokenBucket <- struct{}{}
-			}
-		}
-	}()
+	// Create a token bucket for throttling (300 KB/s)
+	tokenBucket := NewTokenBucket(bandwidthLimit, bandwidthLimit) // maxTokens = bandwidthLimit, refillRate = bandwidthLimit bytes/sec
+	defer tokenBucket.Stop()                                      // Ensure the refill goroutine is stopped
 
 	// Start a fixed number of workers
 	var wg sync.WaitGroup
@@ -201,50 +373,4 @@ func main() {
 	// Wait for a short time before updating again
 	time.Sleep(500 * time.Millisecond)
 	close(results)
-}
-
-func setFileNames(tasks []DownloadTask) {
-	duplicates := make(map[string]int)
-	for v, dt := range tasks {
-
-		if dt.FilePath == "" {
-			duplicates[dt.URL]++
-			temp := strings.Replace(path.Base(dt.URL), "%20", " ", -1)
-			if duplicates[dt.URL] == 1 {
-				tasks[v].FilePath = fmt.Sprintf("%s", temp)
-			} else {
-				temp1 := strings.LastIndex(temp, ".")
-				tasks[v].FilePath = fmt.Sprintf("%s (%d)%s", temp[0:temp1], duplicates[dt.URL]-1, temp[temp1:])
-			}
-
-		}
-
-	}
-}
-
-func setFileType(tasks []DownloadTask) {
-	for v, dt := range tasks {
-
-		temp2 := strings.LastIndex(dt.FilePath, ".")
-		s := fmt.Sprintf("%s", dt.FilePath[temp2+1:])
-
-		s = strings.ToLower(s)
-		if s == "mp3" || s == "wav" || s == "flac" || s == "aac" || s == "wma" {
-			tasks[v].FileType = "Music"
-		} else if s == "mov" || s == "avi" || s == "flac" || s == "mkv" || s == "mp4" {
-			tasks[v].FileType = "Video"
-		} else if s == "zip" || s == "rar" || s == "7z" {
-			tasks[v].FileType = "Compressed"
-		} else if s == "jpeg" || s == "jpg" || s == "png" {
-			tasks[v].FileType = "Pictures"
-		} else if s == "exe" || s == "msi" || s == "pkg" {
-			tasks[v].FileType = "Programs"
-		} else if s == "pdf" || s == "doc" || s == "txt" || s == "html" {
-			tasks[v].FileType = "Video"
-		} else {
-			tasks[v].FileType = "General"
-		}
-
-	}
-
 }
