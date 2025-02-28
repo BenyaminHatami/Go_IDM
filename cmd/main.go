@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"math"
@@ -15,6 +16,7 @@ import (
 
 // DownloadTask represents a single download task
 type DownloadTask struct {
+	ID       int
 	URL      string
 	FilePath string
 	FileType string
@@ -22,6 +24,7 @@ type DownloadTask struct {
 
 // DownloadStatus represents the status of a download
 type DownloadStatus struct {
+	ID            int
 	URL           string
 	Progress      int
 	BytesDone     int    // Bytes downloaded so far
@@ -35,10 +38,16 @@ type DownloadStatus struct {
 	Error         error
 }
 
+// ControlMessage represents a control command
+type ControlMessage struct {
+	TaskID int
+	Action string // "pause", "resume", or "cancel"
+}
+
 // Constants
 const (
 	maxConcurrentDownloads = 3                      // Limit to 3 concurrent downloads
-	bandwidthLimit         = 1500 * 1024            // 300 KB/s (in bytes)
+	bandwidthLimit         = 600 * 1024             // 300 KB/s (in bytes)
 	tokenSize              = 1024                   // 1 KB per token
 	downloadDir            = "Downloads/"           // Folder to save files
 	windowDuration         = 1 * time.Second        // Rolling window for speed calculation
@@ -49,8 +58,10 @@ const (
 
 // Global variables for progress tracking
 var (
-	progressMap = make(map[string]DownloadStatus) // Tracks progress of each download
-	progressMux = sync.Mutex{}                    // Mutex to protect progressMap
+	progressMap  = make(map[string]DownloadStatus)
+	progressMux  = sync.Mutex{}
+	controlChans = make(map[int]chan ControlMessage)
+	controlMux   = sync.Mutex{}
 )
 
 // TokenBucket represents a token bucket system
@@ -131,42 +142,61 @@ func (tb *TokenBucket) WaitForTokens(tokens float64) {
 func worker(id int, jobs <-chan DownloadTask, results chan<- DownloadStatus, tokenBucket *TokenBucket, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for task := range jobs {
-		status := downloadFile(task.URL, task.FilePath, task.FileType, tokenBucket)
+		// Create a control channel for this task
+		controlChan := make(chan ControlMessage)
+		controlMux.Lock()
+		controlChans[task.ID] = controlChan
+		controlMux.Unlock()
+
+		// Run the download
+		status := downloadFile(task, tokenBucket, controlChan)
 		results <- status
+
+		// Clean up the control channel
+		controlMux.Lock()
+		delete(controlChans, task.ID)
+		close(controlChan)
+		// Remove from progressMap if canceled
+		if status.State == "canceled" {
+			progressMux.Lock()
+			delete(progressMap, task.FilePath)
+			progressMux.Unlock()
+		}
+		controlMux.Unlock()
 	}
 }
 
 // downloadFile downloads a file with throttling
-func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucket) DownloadStatus {
+func downloadFile(task DownloadTask, tokenBucket *TokenBucket, controlChan chan ControlMessage) DownloadStatus {
 	// Ensure Downloads directory exists
-	if err := os.MkdirAll(downloadDir+fileType, 0755); err != nil {
-		return DownloadStatus{URL: url, Error: err}
+	if err := os.MkdirAll(downloadDir+task.FileType, 0755); err != nil {
+		return DownloadStatus{URL: task.URL, Error: err}
 	}
 
 	// Full path includes Downloads folder
-	fullPath := filepath.Join(downloadDir+fileType, filePath)
+	fullPath := filepath.Join(downloadDir+task.FileType, task.FilePath)
 
 	// Open the file for writing
 	file, err := os.Create(fullPath)
 	if err != nil {
-		return DownloadStatus{URL: url, Error: err}
+		return DownloadStatus{URL: task.URL, Error: err}
 	}
 	defer file.Close()
 
 	// Send an HTTP GET request
-	resp, err := http.Get(url)
+	resp, err := http.Get(task.URL)
 	if err != nil {
-		return DownloadStatus{URL: url, Error: err}
+		return DownloadStatus{URL: task.URL, Error: err}
 	}
 	defer resp.Body.Close()
 
 	// Check server response
 	if resp.StatusCode != http.StatusOK {
-		return DownloadStatus{URL: url, Error: fmt.Errorf("bad status: %s", resp.Status)}
+		return DownloadStatus{URL: task.URL, Error: fmt.Errorf("bad status: %s", resp.Status)}
 	}
 
 	// Read the response body in chunks
-	buffer := make([]byte, tokenSize) // 1 KB buffer (matches token size)
+	buffer := make([]byte, tokenSize)
 	totalBytes := resp.ContentLength
 	hasTotalBytes := totalBytes != -1
 	bytesDownloaded := 0
@@ -175,83 +205,63 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 
 	// Initialize status with window tracking
 	status := DownloadStatus{
-		URL:           url,
+		ID:            task.ID,
+		URL:           task.URL,
 		TotalBytes:    totalBytes,
 		HasTotalBytes: hasTotalBytes,
 		BytesInWindow: []int{},
 		Timestamps:    []time.Time{},
+		State:         "running",
 	}
 
+	// Download loop with pause/resume/cancel support
 	for {
-		// Wait for tokens before downloading
-		tokenBucket.WaitForTokens(tokenSize)
-
-		n, err := resp.Body.Read(buffer)
-		if n > 0 {
-			file.Write(buffer[:n])
-			bytesDownloaded += n
-			accumulatedBytes += n
-
-			// Calculate progress (if total size is known)
-			progress := 0
-			if hasTotalBytes {
-				progress = int(float64(bytesDownloaded) / float64(totalBytes) * 100)
+		select {
+		case msg := <-controlChan:
+			if msg.TaskID != task.ID {
+				continue
 			}
-
-			// Update rolling window for speed calculation
-			now := time.Now()
-			status.BytesInWindow = append(status.BytesInWindow, n)
-			status.Timestamps = append(status.Timestamps, now)
-
-			// Remove entries outside the 1-second window
-			cutoff := now.Add(-windowDuration)
-			newBytes := []int{}
-			newTimes := []time.Time{}
-			for i, ts := range status.Timestamps {
-				if ts.After(cutoff) {
-					newBytes = append(newBytes, status.BytesInWindow[i])
-					newTimes = append(newTimes, ts)
+			switch msg.Action {
+			case "pause":
+				// Calculate progress before pausing
+				progress := 0
+				if hasTotalBytes {
+					progress = int(float64(bytesDownloaded) / float64(totalBytes) * 100)
 				}
-			}
-			status.BytesInWindow = newBytes
-			status.Timestamps = newTimes
+				// Update speed, ETA, and state before pausing
+				var speed int
+				var windowSeconds float64
+				if len(status.Timestamps) > 1 {
+					first := status.Timestamps[0]
+					last := status.Timestamps[len(status.Timestamps)-1]
+					windowSeconds = last.Sub(first).Seconds()
+				} else if len(status.Timestamps) == 1 {
+					windowSeconds = time.Since(status.Timestamps[0]).Seconds()
+				}
+				if windowSeconds > 0 {
+					var totalBytesInWindow int
+					for _, b := range status.BytesInWindow {
+						totalBytesInWindow += b
+					}
+					speed = int(float64(totalBytesInWindow) / windowSeconds / 1024)
+				} else {
+					speed = 0
+				}
+				var eta string
+				if hasTotalBytes && speed > 0 {
+					remainingBytes := totalBytes - int64(bytesDownloaded)
+					etaSeconds := float64(remainingBytes) / float64(speed*1024)
+					etaDuration := time.Duration(etaSeconds * float64(time.Second))
+					eta = etaDuration.Truncate(time.Second).String()
+				} else {
+					eta = "N/A"
+				}
 
-			// Calculate speed over the window
-			var totalBytesInWindow int
-			for _, b := range status.BytesInWindow {
-				totalBytesInWindow += b
-			}
-			var windowSeconds float64
-			if len(status.Timestamps) > 1 {
-				first := status.Timestamps[0]
-				last := status.Timestamps[len(status.Timestamps)-1]
-				windowSeconds = last.Sub(first).Seconds()
-			} else {
-				windowSeconds = time.Since(status.Timestamps[0]).Seconds()
-			}
-			var speed int
-			if windowSeconds > 0 {
-				speed = int(float64(totalBytesInWindow) / windowSeconds / 1024) // Speed in KB/s
-			} else {
-				speed = 0
-			}
-
-			// Calculate ETA (if total size and speed are known)
-			var eta string
-			if hasTotalBytes && speed > 0 {
-				remainingBytes := totalBytes - int64(bytesDownloaded)
-				etaSeconds := float64(remainingBytes) / float64(speed*1024)
-				etaDuration := time.Duration(etaSeconds * float64(time.Second))
-				eta = etaDuration.Truncate(time.Second).String()
-			} else {
-				eta = "N/A"
-			}
-
-			// Update progressMap only if we've accumulated enough bytes or enough time has passed
-			if accumulatedBytes >= updateIntervalBytes || time.Since(lastUpdate) >= updateIntervalTime {
+				// Update progressMap with the latest progress and paused state
 				progressMux.Lock()
-				progressMap[filePath] = DownloadStatus{
-					URL:           url,
+				progressMap[task.FilePath] = DownloadStatus{
+					ID:            task.ID,
+					URL:           task.URL,
 					Progress:      progress,
 					BytesDone:     bytesDownloaded,
 					TotalBytes:    totalBytes,
@@ -260,35 +270,201 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 					ETA:           eta,
 					BytesInWindow: status.BytesInWindow,
 					Timestamps:    status.Timestamps,
+					State:         "paused",
 				}
 				progressMux.Unlock()
-				accumulatedBytes = 0
-				lastUpdate = now
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				// Final update to ensure 100% progress is shown TODO ???
+
+				// Wait until resumed or canceled
+				for {
+					resumeMsg := <-controlChan
+					if resumeMsg.TaskID == task.ID {
+						if resumeMsg.Action == "resume" {
+							progressMux.Lock()
+							progressMap[task.FilePath] = DownloadStatus{
+								ID:            task.ID,
+								URL:           task.URL,
+								Progress:      progress,
+								BytesDone:     bytesDownloaded,
+								TotalBytes:    totalBytes,
+								HasTotalBytes: hasTotalBytes,
+								Speed:         speed,
+								ETA:           eta,
+								BytesInWindow: status.BytesInWindow,
+								Timestamps:    status.Timestamps,
+								State:         "running",
+							}
+							progressMux.Unlock()
+							status.State = "running"
+							break
+						} else if resumeMsg.Action == "cancel" {
+							// Close file and delete it
+							file.Close()
+							os.Remove(fullPath)
+							// Update progressMap to reflect canceled state
+							progressMux.Lock()
+							progressMap[task.FilePath] = DownloadStatus{
+								ID:            task.ID,
+								URL:           task.URL,
+								Progress:      progress,
+								BytesDone:     bytesDownloaded,
+								TotalBytes:    totalBytes,
+								HasTotalBytes: hasTotalBytes,
+								Speed:         0,
+								ETA:           "N/A",
+								BytesInWindow: status.BytesInWindow,
+								Timestamps:    status.Timestamps,
+								State:         "canceled",
+							}
+							progressMux.Unlock()
+							return DownloadStatus{URL: task.URL, State: "canceled"}
+						}
+					}
+				}
+			case "cancel":
+				// Calculate progress before canceling
+				progress := 0
+				if hasTotalBytes {
+					progress = int(float64(bytesDownloaded) / float64(totalBytes) * 100)
+				}
+				// Close file and delete it
+				file.Close()
+				os.Remove(fullPath)
+				// Update progressMap to reflect canceled state
 				progressMux.Lock()
-				progressMap[filePath] = DownloadStatus{
-					URL:           url,
-					Progress:      100,
+				progressMap[task.FilePath] = DownloadStatus{
+					ID:            task.ID,
+					URL:           task.URL,
+					Progress:      progress,
 					BytesDone:     bytesDownloaded,
 					TotalBytes:    totalBytes,
 					HasTotalBytes: hasTotalBytes,
 					Speed:         0,
-					ETA:           "0s",
+					ETA:           "N/A",
 					BytesInWindow: status.BytesInWindow,
 					Timestamps:    status.Timestamps,
+					State:         "canceled",
 				}
 				progressMux.Unlock()
-				break
+				return DownloadStatus{URL: task.URL, State: "canceled"}
 			}
-			return DownloadStatus{URL: url, Error: err}
+		default:
+			if status.State != "running" {
+				continue
+			}
+
+			// Wait for tokens before downloading
+			tokenBucket.WaitForTokens(tokenSize)
+
+			n, err := resp.Body.Read(buffer)
+			if n > 0 {
+				file.Write(buffer[:n])
+				bytesDownloaded += n
+				accumulatedBytes += n
+
+				// Calculate progress (if total size is known)
+				progress := 0
+				if hasTotalBytes {
+					progress = int(float64(bytesDownloaded) / float64(totalBytes) * 100)
+				}
+
+				// Update rolling window for speed calculation
+				now := time.Now()
+				status.BytesInWindow = append(status.BytesInWindow, n)
+				status.Timestamps = append(status.Timestamps, now)
+
+				// Remove entries outside the 1-second window
+				cutoff := now.Add(-windowDuration)
+				newBytes := []int{}
+				newTimes := []time.Time{}
+				for i, ts := range status.Timestamps {
+					if ts.After(cutoff) {
+						newBytes = append(newBytes, status.BytesInWindow[i])
+						newTimes = append(newTimes, ts)
+					}
+				}
+				status.BytesInWindow = newBytes
+				status.Timestamps = newTimes
+
+				// Calculate speed over the window
+				var totalBytesInWindow int
+				for _, b := range status.BytesInWindow {
+					totalBytesInWindow += b
+				}
+				var windowSeconds float64
+				if len(status.Timestamps) > 1 {
+					first := status.Timestamps[0]
+					last := status.Timestamps[len(status.Timestamps)-1]
+					windowSeconds = last.Sub(first).Seconds()
+				} else {
+					windowSeconds = time.Since(status.Timestamps[0]).Seconds()
+				}
+				var speed int
+				if windowSeconds > 0 {
+					speed = int(float64(totalBytesInWindow) / windowSeconds / 1024)
+				} else {
+					speed = 0
+				}
+
+				// Calculate ETA (if total size and speed are known)
+				var eta string
+				if hasTotalBytes && speed > 0 {
+					remainingBytes := totalBytes - int64(bytesDownloaded)
+					etaSeconds := float64(remainingBytes) / float64(speed*1024)
+					etaDuration := time.Duration(etaSeconds * float64(time.Second))
+					eta = etaDuration.Truncate(time.Second).String()
+				} else {
+					eta = "N/A"
+				}
+
+				// Update progressMap only if we've accumulated enough bytes or enough time has passed
+				if accumulatedBytes >= updateIntervalBytes || time.Since(lastUpdate) >= updateIntervalTime {
+					progressMux.Lock()
+					progressMap[task.FilePath] = DownloadStatus{
+						ID:            task.ID,
+						URL:           task.URL,
+						Progress:      progress,
+						BytesDone:     bytesDownloaded,
+						TotalBytes:    totalBytes,
+						HasTotalBytes: hasTotalBytes,
+						Speed:         speed,
+						ETA:           eta,
+						BytesInWindow: status.BytesInWindow,
+						Timestamps:    status.Timestamps,
+						State:         status.State,
+					}
+					progressMux.Unlock()
+					accumulatedBytes = 0
+					lastUpdate = now
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					// Final update to ensure 100% progress is shown TODO ???
+					progress := 0
+					if hasTotalBytes {
+						progress = int(float64(bytesDownloaded) / float64(totalBytes) * 100)
+					}
+					progressMux.Lock()
+					progressMap[task.FilePath] = DownloadStatus{
+						ID:            task.ID,
+						URL:           task.URL,
+						Progress:      progress,
+						BytesDone:     bytesDownloaded,
+						TotalBytes:    totalBytes,
+						HasTotalBytes: hasTotalBytes,
+						Speed:         0,
+						ETA:           "0s",
+						BytesInWindow: status.BytesInWindow,
+						Timestamps:    status.Timestamps,
+						State:         "completed",
+					}
+					progressMux.Unlock()
+					return DownloadStatus{URL: task.URL, Progress: 100, Speed: 0, State: "completed"}
+				}
+				return DownloadStatus{URL: task.URL, Error: err}
+			}
 		}
 	}
-
-	return DownloadStatus{URL: url, Progress: 100, Speed: 0}
 }
 
 // formatSize converts bytes to human-readable format
@@ -310,7 +486,7 @@ func progressBar(status DownloadStatus) string {
 	if !status.HasTotalBytes {
 		return fmt.Sprintf("%s downloaded", formatSize(status.BytesDone))
 	}
-	const width = 20 // Matches the screenshot
+	const width = 20
 	completed := status.Progress * width / 100
 	bar := strings.Repeat("=", completed) + strings.Repeat("-", width-completed)
 	return fmt.Sprintf("[%s] %d%%", bar, status.Progress)
@@ -322,9 +498,10 @@ func displayProgress() {
 		fmt.Print("\033[H\033[2J") // Clear the terminal
 		progressMux.Lock()
 		for filePath, status := range progressMap {
-			fmt.Printf("Downloading %s: %s (%d KB/s) ETA: %s\n", filePath, progressBar(status), status.Speed, status.ETA)
+			fmt.Printf("Downloading %s (ID: %d): %s (%d KB/s) ETA: %s State: %s\n", filePath, status.ID, progressBar(status), status.Speed, status.ETA, status.State)
 		}
 		progressMux.Unlock()
+		fmt.Println("\nEnter command (e.g., 'pause 1', 'resume 1', 'cancel 1', or 'exit'):")
 		time.Sleep(500 * time.Millisecond)
 	}
 }
@@ -377,11 +554,11 @@ func setFileType(tasks []DownloadTask) {
 func main() {
 	// List of download tasks
 	downloadTasks := []DownloadTask{
-		{URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
+		{ID: 1, URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
 
-		{URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
-		{URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
-		//{URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
+		{ID: 2, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
+		{ID: 3, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
+		{ID: 4, URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
 	}
 	setFileNames(downloadTasks) // TODO should be in a better place! ya do ta ro bezae to ye tabe setType
 	setFileType(downloadTasks)  // TODO should be in a better place!
@@ -391,8 +568,8 @@ func main() {
 	results := make(chan DownloadStatus, len(downloadTasks))
 
 	// Create a token bucket for throttling (300 KB/s)
-	tokenBucket := NewTokenBucket(bandwidthLimit, bandwidthLimit) // maxTokens = bandwidthLimit, refillRate = bandwidthLimit bytes/sec
-	defer tokenBucket.Stop()                                      // Ensure the refill goroutine is stopped
+	tokenBucket := NewTokenBucket(bandwidthLimit, bandwidthLimit)
+	defer tokenBucket.Stop()
 
 	// Start a fixed number of workers
 	var wg sync.WaitGroup
@@ -412,11 +589,47 @@ func main() {
 	// Start the progress display
 	go displayProgress()
 
+	// Command-line input for pause/resume/cancel
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			input := strings.TrimSpace(scanner.Text())
+			if input == "exit" {
+				fmt.Println("Exiting...")
+				os.Exit(0)
+			}
+			parts := strings.Split(input, " ")
+			if len(parts) != 2 {
+				fmt.Println("Invalid command. Use 'pause ID', 'resume ID', or 'cancel ID' (e.g., 'pause 1')")
+				continue
+			}
+			var taskID int
+			_, err := fmt.Sscanf(parts[1], "%d", &taskID)
+			if err != nil {
+				fmt.Println("Invalid task ID. Must be a number.")
+				continue
+			}
+			controlMux.Lock()
+			if controlChan, ok := controlChans[taskID]; ok {
+				controlChan <- ControlMessage{TaskID: taskID, Action: parts[0]}
+				fmt.Printf("%s command sent for task ID %d\n", parts[0], taskID)
+			} else {
+				fmt.Printf("Task ID %d not found or already completed/canceled\n", taskID)
+			}
+			controlMux.Unlock()
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+		}
+	}()
+
 	// Collect results
 	go func() {
 		for result := range results {
 			if result.Error != nil {
 				fmt.Printf("Download failed for %s: %v\n", result.URL, result.Error)
+			} else if result.State == "canceled" {
+				fmt.Printf("Download canceled for %s\n", result.URL)
 			} else {
 				fmt.Printf("Download completed for %s\n", result.URL)
 			}
