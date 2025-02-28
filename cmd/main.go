@@ -8,6 +8,9 @@ import (
 	"path"
 	"time"
 
+	ui "myproject/internal/ui/download_tab"
+
+	"github.com/rivo/tview"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -78,18 +81,6 @@ func downloadFile(url string) error {
 }
 
 func main() {
-	var url string
-	fmt.Println("Enter the URL of the file to download:")
-	fmt.Scanln(&url)
-
-	if url == "" {
-		fmt.Println("Please provide a valid URL")
-		return
-	}
-
-	err := downloadFile(url)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
+	app := tview.NewApplication()
+	ui.CreateForm(app)
 }
