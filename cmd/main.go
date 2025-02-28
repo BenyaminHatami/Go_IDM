@@ -24,8 +24,12 @@ type DownloadTask struct {
 type DownloadStatus struct {
 	URL           string
 	Progress      int
+	BytesDone     int    // Bytes downloaded so far
+	TotalBytes    int64  // Total file size (if known)
+	HasTotalBytes bool   // Whether totalBytes is known
 	State         string // "running", "paused", "canceled", "completed"
 	Speed         int    // Speed in KB/s
+	ETA           string // Estimated time of arrival
 	BytesInWindow []int  // Bytes downloaded in recent window
 	Timestamps    []time.Time
 	Error         error
@@ -33,14 +37,14 @@ type DownloadStatus struct {
 
 // Constants
 const (
-	maxConcurrentDownloads = 3                     // Limit to 3 concurrent downloads
-	bandwidthLimit         = 300 * 1024            // 300 KB/s (in bytes)
-	tokenSize              = 1024                  // 1 KB per token
-	downloadDir            = "Downloads/"          // Folder to save files
-	windowDuration         = 1 * time.Second       // Rolling window for speed calculation
-	updateIntervalBytes    = 10 * 1024             // Update progressMap every 10 KB
-	updateIntervalTime     = 10 * time.Millisecond // Update progressMap every 100ms
-	refillInterval         = 10 * time.Millisecond // Refill token bucket every 10ms
+	maxConcurrentDownloads = 3                      // Limit to 3 concurrent downloads
+	bandwidthLimit         = 1500 * 1024            // 300 KB/s (in bytes)
+	tokenSize              = 1024                   // 1 KB per token
+	downloadDir            = "Downloads/"           // Folder to save files
+	windowDuration         = 1 * time.Second        // Rolling window for speed calculation
+	updateIntervalBytes    = 10 * 1024              // Update progressMap every 10 KB
+	updateIntervalTime     = 100 * time.Millisecond // Update progressMap every 100ms
+	refillInterval         = 10 * time.Millisecond  // Refill token bucket every 10ms
 )
 
 // Global variables for progress tracking
@@ -164,6 +168,7 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 	// Read the response body in chunks
 	buffer := make([]byte, tokenSize) // 1 KB buffer (matches token size)
 	totalBytes := resp.ContentLength
+	hasTotalBytes := totalBytes != -1
 	bytesDownloaded := 0
 	accumulatedBytes := 0 // For updating progressMap less frequently
 	lastUpdate := time.Now()
@@ -171,6 +176,8 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 	// Initialize status with window tracking
 	status := DownloadStatus{
 		URL:           url,
+		TotalBytes:    totalBytes,
+		HasTotalBytes: hasTotalBytes,
 		BytesInWindow: []int{},
 		Timestamps:    []time.Time{},
 	}
@@ -185,8 +192,11 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 			bytesDownloaded += n
 			accumulatedBytes += n
 
-			// Calculate progress
-			progress := int(float64(bytesDownloaded) / float64(totalBytes) * 100)
+			// Calculate progress (if total size is known)
+			progress := 0
+			if hasTotalBytes {
+				progress = int(float64(bytesDownloaded) / float64(totalBytes) * 100)
+			}
 
 			// Update rolling window for speed calculation
 			now := time.Now()
@@ -226,13 +236,28 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 				speed = 0
 			}
 
+			// Calculate ETA (if total size and speed are known)
+			var eta string
+			if hasTotalBytes && speed > 0 {
+				remainingBytes := totalBytes - int64(bytesDownloaded)
+				etaSeconds := float64(remainingBytes) / float64(speed*1024)
+				etaDuration := time.Duration(etaSeconds * float64(time.Second))
+				eta = etaDuration.Truncate(time.Second).String()
+			} else {
+				eta = "N/A"
+			}
+
 			// Update progressMap only if we've accumulated enough bytes or enough time has passed
 			if accumulatedBytes >= updateIntervalBytes || time.Since(lastUpdate) >= updateIntervalTime {
 				progressMux.Lock()
 				progressMap[filePath] = DownloadStatus{
 					URL:           url,
 					Progress:      progress,
+					BytesDone:     bytesDownloaded,
+					TotalBytes:    totalBytes,
+					HasTotalBytes: hasTotalBytes,
 					Speed:         speed,
+					ETA:           eta,
 					BytesInWindow: status.BytesInWindow,
 					Timestamps:    status.Timestamps,
 				}
@@ -243,7 +268,20 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 		}
 		if err != nil {
 			if err == io.EOF {
-				// TODO
+				// Final update to ensure 100% progress is shown TODO ???
+				progressMux.Lock()
+				progressMap[filePath] = DownloadStatus{
+					URL:           url,
+					Progress:      100,
+					BytesDone:     bytesDownloaded,
+					TotalBytes:    totalBytes,
+					HasTotalBytes: hasTotalBytes,
+					Speed:         0,
+					ETA:           "0s",
+					BytesInWindow: status.BytesInWindow,
+					Timestamps:    status.Timestamps,
+				}
+				progressMux.Unlock()
 				break
 			}
 			return DownloadStatus{URL: url, Error: err}
@@ -253,12 +291,29 @@ func downloadFile(url, filePath string, fileType string, tokenBucket *TokenBucke
 	return DownloadStatus{URL: url, Progress: 100, Speed: 0}
 }
 
-// progressBar generates a progress bar string
-func progressBar(progress int) string {
-	const width = 40 // Matches the screenshot
-	completed := progress * width / 100
+// formatSize converts bytes to human-readable format
+func formatSize(bytes int) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// progressBar generates a progress bar string or bytes downloaded if size is unknown
+func progressBar(status DownloadStatus) string {
+	if !status.HasTotalBytes {
+		return fmt.Sprintf("%s downloaded", formatSize(status.BytesDone))
+	}
+	const width = 20 // Matches the screenshot
+	completed := status.Progress * width / 100
 	bar := strings.Repeat("=", completed) + strings.Repeat("-", width-completed)
-	return fmt.Sprintf("[%s] %d%%", bar, progress)
+	return fmt.Sprintf("[%s] %d%%", bar, status.Progress)
 }
 
 // displayProgress updates the terminal with the progress of all downloads
@@ -267,10 +322,10 @@ func displayProgress() {
 		fmt.Print("\033[H\033[2J") // Clear the terminal
 		progressMux.Lock()
 		for filePath, status := range progressMap {
-			fmt.Printf("Downloading %s: %s (%d KB/s)\n", filePath, progressBar(status.Progress), status.Speed)
+			fmt.Printf("Downloading %s: %s (%d KB/s) ETA: %s\n", filePath, progressBar(status), status.Speed, status.ETA)
 		}
 		progressMux.Unlock()
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
