@@ -1,4 +1,4 @@
-package ui
+package download_tab
 
 import (
 	"github.com/rivo/tview"
