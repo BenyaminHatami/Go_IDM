@@ -329,6 +329,23 @@ func updateRollingWindow(bytesInWindow *[]int, timestamps *[]time.Time, n int, n
 	*timestamps = newTimes
 }
 
+// Helper function to create a DownloadStatus with common fields
+func newDownloadStatus(task DownloadTask, status *DownloadStatus, progress int, bytesDownloaded int, totalBytes int64, hasTotalBytes bool, speed int, eta string, state string) DownloadStatus {
+	return DownloadStatus{
+		ID:            task.ID,
+		URL:           task.URL,
+		Progress:      progress,
+		BytesDone:     bytesDownloaded,
+		TotalBytes:    totalBytes,
+		HasTotalBytes: hasTotalBytes,
+		Speed:         speed,
+		ETA:           eta,
+		BytesInWindow: status.BytesInWindow,
+		Timestamps:    status.Timestamps,
+		State:         state,
+	}
+}
+
 // Helper function to handle control messages (pause, resume, cancel)
 func handleControlMessage(status *DownloadStatus, task DownloadTask, file *os.File, fullPath string, bytesDownloaded int, totalBytes int64, hasTotalBytes bool, controlChan chan ControlMessage, msg ControlMessage) error {
 	progress := calculateProgress(bytesDownloaded, totalBytes, hasTotalBytes)
@@ -336,125 +353,46 @@ func handleControlMessage(status *DownloadStatus, task DownloadTask, file *os.Fi
 
 	switch msg.Action {
 	case "pause":
+		// Update progressMap to reflect paused state
 		progressMux.Lock()
-		progressMap[task.FilePath] = DownloadStatus{
-			ID:            task.ID,
-			URL:           task.URL,
-			Progress:      progress,
-			BytesDone:     bytesDownloaded,
-			TotalBytes:    totalBytes,
-			HasTotalBytes: hasTotalBytes,
-			Speed:         speed,
-			ETA:           eta,
-			BytesInWindow: status.BytesInWindow,
-			Timestamps:    status.Timestamps,
-			State:         "paused",
-		}
+		progressMap[task.FilePath] = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, speed, eta, "paused")
 		progressMux.Unlock()
 
+		// Wait for resume or cancel
 		for {
 			resumeMsg := <-controlChan
 			if resumeMsg.TaskID == task.ID {
 				if resumeMsg.Action == "resume" {
+					// Resume the download
 					progressMux.Lock()
-					progressMap[task.FilePath] = DownloadStatus{
-						ID:            task.ID,
-						URL:           task.URL,
-						Progress:      progress,
-						BytesDone:     bytesDownloaded,
-						TotalBytes:    totalBytes,
-						HasTotalBytes: hasTotalBytes,
-						Speed:         speed,
-						ETA:           eta,
-						BytesInWindow: status.BytesInWindow,
-						Timestamps:    status.Timestamps,
-						State:         "running",
-					}
+					progressMap[task.FilePath] = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, speed, eta, "running")
 					progressMux.Unlock()
-					*status = DownloadStatus{
-						ID:            task.ID,
-						URL:           task.URL,
-						Progress:      progress,
-						BytesDone:     bytesDownloaded,
-						TotalBytes:    totalBytes,
-						HasTotalBytes: hasTotalBytes,
-						Speed:         speed,
-						ETA:           eta,
-						BytesInWindow: status.BytesInWindow,
-						Timestamps:    status.Timestamps,
-						State:         "running",
-					}
+					*status = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, speed, eta, "running")
 					return nil
 				} else if resumeMsg.Action == "cancel" {
+					// Cancel the download while paused
 					file.Close()
 					if err := os.Remove(fullPath); err != nil {
 						return err
 					}
 					progressMux.Lock()
-					progressMap[task.FilePath] = DownloadStatus{
-						ID:            task.ID,
-						URL:           task.URL,
-						Progress:      progress,
-						BytesDone:     bytesDownloaded,
-						TotalBytes:    totalBytes,
-						HasTotalBytes: hasTotalBytes,
-						Speed:         0,
-						ETA:           "N/A",
-						BytesInWindow: status.BytesInWindow,
-						Timestamps:    status.Timestamps,
-						State:         "canceled",
-					}
+					progressMap[task.FilePath] = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, 0, "N/A", "canceled")
 					progressMux.Unlock()
-					*status = DownloadStatus{
-						ID:            task.ID,
-						URL:           task.URL,
-						Progress:      progress,
-						BytesDone:     bytesDownloaded,
-						TotalBytes:    totalBytes,
-						HasTotalBytes: hasTotalBytes,
-						Speed:         0,
-						ETA:           "N/A",
-						BytesInWindow: status.BytesInWindow,
-						Timestamps:    status.Timestamps,
-						State:         "canceled",
-					}
+					*status = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, 0, "N/A", "canceled")
 					return nil
 				}
 			}
 		}
 	case "cancel":
+		// Cancel the download immediately
 		file.Close()
 		if err := os.Remove(fullPath); err != nil {
 			return err
 		}
 		progressMux.Lock()
-		progressMap[task.FilePath] = DownloadStatus{
-			ID:            task.ID,
-			URL:           task.URL,
-			Progress:      progress,
-			BytesDone:     bytesDownloaded,
-			TotalBytes:    totalBytes,
-			HasTotalBytes: hasTotalBytes,
-			Speed:         0,
-			ETA:           "N/A",
-			BytesInWindow: status.BytesInWindow,
-			Timestamps:    status.Timestamps,
-			State:         "canceled",
-		}
+		progressMap[task.FilePath] = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, 0, "N/A", "canceled")
 		progressMux.Unlock()
-		*status = DownloadStatus{
-			ID:            task.ID,
-			URL:           task.URL,
-			Progress:      progress,
-			BytesDone:     bytesDownloaded,
-			TotalBytes:    totalBytes,
-			HasTotalBytes: hasTotalBytes,
-			Speed:         0,
-			ETA:           "N/A",
-			BytesInWindow: status.BytesInWindow,
-			Timestamps:    status.Timestamps,
-			State:         "canceled",
-		}
+		*status = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, 0, "N/A", "canceled")
 		return nil
 	}
 	return nil
