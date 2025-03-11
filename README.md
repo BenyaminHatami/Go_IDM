@@ -13,3 +13,6 @@ https://github.com/Mohamed-khattab/Token-bucket-rate-limiter
 ```
 https://github.com/gammazero/workerpool/blob/main/workerpool.go
 ```
+```
+https://github.com/cdhtlr/GoParallelDownload
+```
