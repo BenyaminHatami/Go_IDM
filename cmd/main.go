@@ -117,8 +117,7 @@ func Run() (bool, error) {
 	defer debug.FreeOSMemory()
 	downloadCompleted = 0
 
-	concurentConn := 4
-
+	concurrentConn := 8
 	acceptRangeSupported, fileSize := isAcceptRangeSupported()
 
 	begin := time.Now()
@@ -127,26 +126,26 @@ func Run() (bool, error) {
 		if acceptRangeSupported {
 			fmt.Println("Accept-Ranges supported")
 
-			partSize := fileSize / concurentConn
-			done := make(chan bool, concurentConn)
+			partSize := fileSize / concurrentConn
+			done := make(chan bool, concurrentConn)
 
-			for i := 0; i < concurentConn; i++ {
+			for i := 0; i < concurrentConn; i++ {
 				start := i * partSize
 				end := (i+1)*partSize - 1
-				if i == concurentConn-1 {
+				if i == concurrentConn-1 {
 					end = fileSize - 1
 				}
 				go downloadPart(start, end, done)
 			}
-			for i := 0; i < concurentConn; i++ {
+			for i := 0; i < concurrentConn; i++ {
 				<-done
 			}
-			err := mergeFiles(fileSize, concurentConn)
+			err := mergeFiles(fileSize, concurrentConn)
 			if err != nil {
 				return false, err
 			}
 		} else {
-			concurentConn = 1
+			concurrentConn = 1
 			fmt.Println("Accept-Ranges not supported")
 			download()
 		}
@@ -156,7 +155,7 @@ func Run() (bool, error) {
 		return false, errors.New("Download timed out!")
 	}
 
-	if downloadCompleted != concurentConn {
+	if downloadCompleted != concurrentConn {
 		return false, errors.New("Download error :(")
 	}
 
