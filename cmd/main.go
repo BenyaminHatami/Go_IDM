@@ -163,8 +163,8 @@ type WorkerPool struct {
 	wait         bool
 }
 
-// New creates a new WorkerPool
-func New(maxWorkers int) *WorkerPool {
+// New creates a new Worker Pool
+func NewWorkerPool(maxWorkers int) *WorkerPool {
 	if maxWorkers < 1 {
 		maxWorkers = 1
 	}
@@ -246,34 +246,49 @@ func (p *WorkerPool) stop(wait bool) {
 
 // downloadFile handles the downloading logic
 func downloadFile(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus) {
-	if err := os.MkdirAll(downloadDir+task.FileType, 0755); err != nil {
+	fullPath, err := setupDownloadFile(task)
+	if err != nil {
 		results <- DownloadStatus{URL: task.URL, Error: err}
 		return
 	}
 
-	// Use the task's individual token bucket instead of shared one
-	tokenBucket := task.TokenBucket
-
-	fullPath := filepath.Join(downloadDir+task.FileType, task.FilePath)
-	file, err := os.Create(fullPath)
+	file, resp, err := initiateDownload(fullPath, task.URL)
 	if err != nil {
 		results <- DownloadStatus{URL: task.URL, Error: err}
 		return
 	}
 	defer file.Close()
-
-	resp, err := http.Get(task.URL)
-	if err != nil {
-		results <- DownloadStatus{URL: task.URL, Error: err}
-		return
-	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		results <- DownloadStatus{URL: task.URL, Error: fmt.Errorf("bad status: %s", resp.Status)}
-		return
-	}
+	processDownload(task, file, resp, controlChan, results)
+}
 
+func setupDownloadFile(task DownloadTask) (string, error) {
+	if err := os.MkdirAll(downloadDir+task.FileType, 0755); err != nil {
+		return "", err
+	}
+	return filepath.Join(downloadDir+task.FileType, task.FilePath), nil
+}
+
+func initiateDownload(fullPath, url string) (*os.File, *http.Response, error) {
+	file, err := os.Create(fullPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		file.Close()
+		resp.Body.Close()
+		return nil, nil, fmt.Errorf("bad status: %s", resp.Status)
+	}
+	return file, resp, nil
+}
+
+func processDownload(task DownloadTask, file *os.File, resp *http.Response, controlChan chan ControlMessage, results chan<- DownloadStatus) {
 	totalBytes := resp.ContentLength
 	hasTotalBytes := totalBytes != -1
 	bytesDownloaded := 0
@@ -293,49 +308,48 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 	for {
 		select {
 		case msg := <-controlChan:
-			if msg.TaskID != task.ID {
-				continue
-			}
-			if err := handleControlMessage(&status, task, file, fullPath, bytesDownloaded, totalBytes, hasTotalBytes, controlChan, msg); err != nil {
-				results <- DownloadStatus{URL: task.URL, Error: err}
-				return
-			}
-			if status.State == "canceled" {
-				results <- status
-				return
+			if msg.TaskID == task.ID {
+				if err := handleControlMessage(&status, task, file, task.FilePath, bytesDownloaded, totalBytes, hasTotalBytes, controlChan, msg); err != nil {
+					results <- DownloadStatus{URL: task.URL, Error: err}
+					return
+				}
+				if status.State == "canceled" {
+					results <- status
+					return
+				}
 			}
 		default:
 			if status.State != "running" {
 				continue
 			}
-
-			tokenBucket.WaitForTokens(tokenSize)
-			n, err := readAndWriteChunk(resp.Body, file, buffer)
-			if err != nil {
+			if err := downloadChunk(task, file, resp.Body, buffer, &status, &bytesDownloaded, &accumulatedBytes, &lastUpdate); err != nil {
 				if err == io.EOF {
 					updateProgressMap(task.FilePath, status, 100, bytesDownloaded, totalBytes, hasTotalBytes, 0, "0s", "completed")
 					results <- DownloadStatus{URL: task.URL, Progress: 100, State: "completed"}
-					return
+				} else {
+					results <- DownloadStatus{URL: task.URL, Error: err}
 				}
-				results <- DownloadStatus{URL: task.URL, Error: err}
 				return
-			}
-
-			bytesDownloaded += n
-			accumulatedBytes += n
-			updateRollingWindow(&status.BytesInWindow, &status.Timestamps, n, time.Now())
-			if accumulatedBytes >= updateIntervalBytes || time.Since(lastUpdate) >= updateIntervalTime {
-				progress := calculateProgress(bytesDownloaded, totalBytes, hasTotalBytes)
-				if hasTotalBytes && int64(bytesDownloaded) >= totalBytes {
-					progress = 100
-				}
-				speed, eta := calculateSpeedAndETA(status.BytesInWindow, status.Timestamps, bytesDownloaded, totalBytes, hasTotalBytes)
-				updateProgressMap(task.FilePath, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, speed, eta, status.State)
-				accumulatedBytes = 0
-				lastUpdate = time.Now()
 			}
 		}
 	}
+}
+
+func downloadChunk(task DownloadTask, file *os.File, body io.Reader, buffer []byte, status *DownloadStatus, bytesDownloaded, accumulatedBytes *int, lastUpdate *time.Time) error {
+	task.TokenBucket.WaitForTokens(tokenSize)
+	n, err := readAndWriteChunk(body, file, buffer)
+	if err != nil {
+		return err
+	}
+	*bytesDownloaded += n
+	*accumulatedBytes += n
+	updateRollingWindow(&status.BytesInWindow, &status.Timestamps, n, time.Now())
+	if *accumulatedBytes >= updateIntervalBytes || time.Since(*lastUpdate) >= updateIntervalTime {
+		updateProgress(status, task.FilePath, *bytesDownloaded, status.TotalBytes, status.HasTotalBytes)
+		*accumulatedBytes = 0
+		*lastUpdate = time.Now()
+	}
+	return nil
 }
 
 // Helper functions
@@ -579,193 +593,230 @@ func setFileType(tasks []DownloadTask) {
 
 // processQueue updated to handle nil StartTime/StopTime
 func processQueue(queue DownloadQueue, pool *WorkerPool, results chan<- DownloadStatus) {
-	queuePool := New(queue.ConcurrentLimit)
+	queuePool := setupQueuePool(queue)
+	startTimeCheck(queue)
+	submitQueueTasks(queue, queuePool, results)
+	queuePool.StopWait()
+}
 
-	// Calculate bandwidth per download in this queue
-	bandwidthPerDownload := queue.SpeedLimit / float64(queue.ConcurrentLimit)
-
-	// Assign token buckets to each task in the queue
+func setupQueuePool(queue DownloadQueue) *WorkerPool {
+	bandwidthPerDownload := queue.SpeedLimit / float64(len(queue.Tasks))
 	for i := range queue.Tasks {
 		queue.Tasks[i].TokenBucket = NewTokenBucket(bandwidthPerDownload, bandwidthPerDownload)
 	}
+	return NewWorkerPool(queue.ConcurrentLimit)
+}
 
-	// Time check loop (only if either StartTime or StopTime is set)
+func startTimeCheck(queue DownloadQueue) {
 	if queue.StartTime != nil || queue.StopTime != nil {
 		go func() {
 			for {
-				now := time.Now()
-				withinTimeWindow := true
-
-				// Check StartTime if set
-				if queue.StartTime != nil {
-					startToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StartTime.Hour(), queue.StartTime.Minute(), 0, 0, time.Local)
-					if now.Before(startToday) {
-						withinTimeWindow = false
-					}
-				}
-
-				// Check StopTime if set
-				if queue.StopTime != nil {
-					stopToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StopTime.Hour(), queue.StopTime.Minute(), 0, 0, time.Local)
-					if now.After(stopToday) {
-						withinTimeWindow = false
-					}
-				}
-
-				for _, task := range queue.Tasks {
-					controlMux.Lock()
-					if controlChan, ok := controlChans[task.ID]; ok {
-						if withinTimeWindow {
-							if status, exists := progressMap[task.FilePath]; exists && status.State == "paused" && status.Error == nil {
-								controlChan <- ControlMessage{TaskID: task.ID, Action: "resume"}
-								fmt.Printf("Resuming task %d due to time window\n", task.ID)
-							}
-						} else {
-							if status, exists := progressMap[task.FilePath]; exists && status.State == "running" {
-								controlChan <- ControlMessage{TaskID: task.ID, Action: "pause"}
-								fmt.Printf("Pausing task %d due to time window\n", task.ID)
-							}
-						}
-					}
-					controlMux.Unlock()
-				}
-
-				// Check every 10 seconds for testing (adjust as needed)
+				checkQueueTimeWindow(queue)
 				time.Sleep(10 * time.Second)
 			}
 		}()
 	}
+}
 
+func checkQueueTimeWindow(queue DownloadQueue) {
+	now := time.Now()
+	withinTimeWindow := true
+	if queue.StartTime != nil {
+		startToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StartTime.Hour(), queue.StartTime.Minute(), 0, 0, time.Local)
+		if now.Before(startToday) {
+			withinTimeWindow = false
+		}
+	}
+	if queue.StopTime != nil {
+		stopToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StopTime.Hour(), queue.StopTime.Minute(), 0, 0, time.Local)
+		if now.After(stopToday) {
+			withinTimeWindow = false
+		}
+	}
+	controlQueueTasks(queue, withinTimeWindow)
+}
+
+func controlQueueTasks(queue DownloadQueue, withinTimeWindow bool) {
+	for _, task := range queue.Tasks {
+		controlMux.Lock()
+		if controlChan, ok := controlChans[task.ID]; ok {
+			if withinTimeWindow {
+				if status, exists := progressMap[task.FilePath]; exists && status.State == "paused" && status.Error == nil {
+					controlChan <- ControlMessage{TaskID: task.ID, Action: "resume"}
+					fmt.Printf("Resuming task %d due to time window\n", task.ID)
+				}
+			} else {
+				if status, exists := progressMap[task.FilePath]; exists && status.State == "running" {
+					controlChan <- ControlMessage{TaskID: task.ID, Action: "pause"}
+					fmt.Printf("Pausing task %d due to time window\n", task.ID)
+				}
+			}
+		}
+		controlMux.Unlock()
+	}
+}
+
+func submitQueueTasks(queue DownloadQueue, queuePool *WorkerPool, results chan<- DownloadStatus) {
 	for _, task := range queue.Tasks {
 		controlChan := make(chan ControlMessage)
 		controlMux.Lock()
 		controlChans[task.ID] = controlChan
 		controlMux.Unlock()
-
 		queuePool.Submit(func() {
 			downloadFile(task, controlChan, results)
-			controlMux.Lock()
-			delete(controlChans, task.ID)
-			close(controlChan)
-			if status, ok := progressMap[task.FilePath]; ok && (status.State == "completed" || status.State == "canceled") {
-				progressMux.Lock()
-				delete(progressMap, task.FilePath)
-				progressMux.Unlock()
-			}
-			controlMux.Unlock()
-			task.TokenBucket.Stop()
+			cleanupTask(task)
 		})
 	}
-
-	queuePool.StopWait()
 }
 
-func main() {
-	now := time.Now()
-	startTime1 := now                     // Start now
-	stopTime1 := now.Add(4 * time.Second) // Stop in 2 hours
+func cleanupTask(task DownloadTask) {
+	controlMux.Lock()
+	delete(controlChans, task.ID)
+	close(controlChans[task.ID])
+	if status, ok := progressMap[task.FilePath]; ok && (status.State == "completed" || status.State == "canceled") {
+		progressMux.Lock()
+		delete(progressMap, task.FilePath)
+		progressMux.Unlock()
+	}
+	controlMux.Unlock()
+	task.TokenBucket.Stop()
+}
 
-	// Define multiple download queues with optional time limits
-	downloadQueues := []DownloadQueue{
+// ---- Helper Functions ----
+func updateProgress(status *DownloadStatus, filePath string, bytesDownloaded int, totalBytes int64, hasTotalBytes bool) {
+	progress := calculateProgress(bytesDownloaded, totalBytes, hasTotalBytes)
+	speed, eta := calculateSpeedAndETA(status.BytesInWindow, status.Timestamps, bytesDownloaded, totalBytes, hasTotalBytes)
+	updateProgressMap(filePath, *status, progress, bytesDownloaded, totalBytes, hasTotalBytes, speed, eta, status.State)
+}
+
+func setupDownloadQueues() []DownloadQueue {
+	now := time.Now()
+	startTime1 := now
+	stopTime1 := now.Add(2 * time.Hour)
+	queues := []DownloadQueue{
 		{
 			Tasks: []DownloadTask{
 				{ID: 1, URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
 				{ID: 2, URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
 			},
-			SpeedLimit:      float64(totalBandwidthLimit) * 0.6, // 300 KB/s
+			SpeedLimit:      float64(totalBandwidthLimit) * 0.6,
 			ConcurrentLimit: 1,
-			StartTime:       &startTime1, // Start now
-			StopTime:        &stopTime1,  // Stop in 2 hours
+			StartTime:       &startTime1,
+			StopTime:        &stopTime1,
 		},
 		{
 			Tasks: []DownloadTask{
 				{ID: 3, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
 				{ID: 4, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
 			},
-			SpeedLimit:      float64(totalBandwidthLimit) * 0.4, // 200 KB/s
-			ConcurrentLimit: 1,
-			StartTime:       nil, // No start time (infinite)
-			StopTime:        nil, // No stop time (infinite)
+			SpeedLimit:      float64(totalBandwidthLimit) * 0.4,
+			ConcurrentLimit: 2,
+			StartTime:       nil,
+			StopTime:        nil,
 		},
 	}
-
-	// Set file names and types for all tasks in all queues
-	for i := range downloadQueues {
-		setFileNames(downloadQueues[i].Tasks)
-		setFileType(downloadQueues[i].Tasks)
+	for i := range queues {
+		setFileNames(queues[i].Tasks)
+		setFileType(queues[i].Tasks)
 	}
+	return queues
+}
 
-	results := make(chan DownloadStatus, 10)
-	pool := New(2)
-
-	var wg sync.WaitGroup
-
+func startProgressDisplay(wg *sync.WaitGroup) {
 	wg.Add(1)
-	go displayProgress(&wg)
+	go displayProgress(wg)
+}
 
-	// Process each queue
-	for _, queue := range downloadQueues {
-		pool.Submit(func() {
-			processQueue(queue, pool, results)
-		})
-	}
-
+func handleUserInput(wg *sync.WaitGroup, pool *WorkerPool) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
-			input := strings.TrimSpace(scanner.Text())
-			if input == "exit" {
-				fmt.Println("Exiting...")
-				pool.StopWait()
-				close(stopDisplay)
+			if !processCommand(scanner.Text(), pool) {
 				return
 			}
-			parts := strings.Split(input, " ")
-			if len(parts) != 2 {
-				fmt.Println("Invalid command. Use 'pause ID', 'resume ID', or 'cancel ID' (e.g., 'pause 1')")
-				continue
-			}
-			var taskID int
-			_, err := fmt.Sscanf(parts[1], "%d", &taskID)
-			if err != nil {
-				fmt.Println("Invalid task ID. Must be a number.")
-				continue
-			}
-			controlMux.Lock()
-			if controlChan, ok := controlChans[taskID]; ok {
-				controlChan <- ControlMessage{TaskID: taskID, Action: parts[0]}
-				fmt.Printf("%s command sent for task ID %d\n", parts[0], taskID)
-			} else {
-				fmt.Printf("Task ID %d not found or already completed/canceled\n", taskID)
-			}
-			controlMux.Unlock()
 		}
 	}()
+}
 
+func processCommand(input string, pool *WorkerPool) bool {
+	input = strings.TrimSpace(input)
+	if input == "exit" {
+		fmt.Println("Exiting...")
+		pool.StopWait()
+		close(stopDisplay)
+		return false
+	}
+	parts := strings.Split(input, " ")
+	if len(parts) != 2 {
+		fmt.Println("Invalid command. Use 'pause ID', 'resume ID', or 'cancel ID'")
+		return true
+	}
+	var taskID int
+	if _, err := fmt.Sscanf(parts[1], "%d", &taskID); err != nil {
+		fmt.Println("Invalid task ID. Must be a number.")
+		return true
+	}
+	sendControlMessage(taskID, parts[0])
+	return true
+}
+
+func sendControlMessage(taskID int, action string) {
+	controlMux.Lock()
+	if controlChan, ok := controlChans[taskID]; ok {
+		controlChan <- ControlMessage{TaskID: taskID, Action: action}
+		fmt.Printf("%s command sent for task ID %d\n", action, taskID)
+	} else {
+		fmt.Printf("Task ID %d not found or already completed/canceled\n", taskID)
+	}
+	controlMux.Unlock()
+}
+
+func monitorDownloads(wg *sync.WaitGroup, results chan DownloadStatus, totalTasks int) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		totalTasks := 0
-		for _, q := range downloadQueues {
-			totalTasks += len(q.Tasks)
-		}
 		count := 0
 		for result := range results {
-			if result.Error != nil {
-				fmt.Printf("Download failed for %s: %v\n", result.URL, result.Error)
-			} else if result.State == "canceled" {
-				fmt.Printf("Download canceled for %s\n", result.URL)
-			} else {
-				fmt.Printf("Download completed for %s\n", result.URL)
-			}
+			reportDownloadResult(result)
 			count++
 			if count == totalTasks {
 				close(stopDisplay)
 			}
 		}
 	}()
+}
+
+func reportDownloadResult(result DownloadStatus) {
+	if result.Error != nil {
+		fmt.Printf("Download failed for %s: %v\n", result.URL, result.Error)
+	} else if result.State == "canceled" {
+		fmt.Printf("Download canceled for %s\n", result.URL)
+	} else {
+		fmt.Printf("Download completed for %s\n", result.URL)
+	}
+}
+
+func main() {
+	downloadQueues := setupDownloadQueues()
+	results := make(chan DownloadStatus, 10)
+	pool := NewWorkerPool(2)
+	var wg sync.WaitGroup
+
+	startProgressDisplay(&wg)
+	for _, queue := range downloadQueues {
+		pool.Submit(func() {
+			processQueue(queue, pool, results)
+		})
+	}
+	handleUserInput(&wg, pool)
+
+	totalTasks := 0
+	for _, q := range downloadQueues {
+		totalTasks += len(q.Tasks)
+	}
+	monitorDownloads(&wg, results, totalTasks)
 
 	pool.StopWait()
 	close(results)
