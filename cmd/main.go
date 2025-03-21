@@ -253,19 +253,25 @@ func (p *WorkerPool) stop(wait bool) {
 }
 
 func downloadFile(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, maxRetries int, queue DownloadQueue) {
-	// Notify start of download
-	activeTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
-	redistributeBandwidth(queue)
-
 	retriesLeft := maxRetries
-	for retriesLeft >= 0 {
+	for {
+		// Notify start of download
+		activeTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
+		redistributeBandwidth(queue)
+
 		status := DownloadStatus{
 			ID:          task.ID,
 			URL:         task.URL,
 			State:       "running",
 			RetriesLeft: retriesLeft,
 		}
-		if err := tryDownload(task, controlChan, results, &status); err != nil {
+		err := tryDownload(task, controlChan, results, &status)
+		if err != nil && status.State == "reset" {
+			// Reset requested: clean up and restart the download
+			fmt.Printf("Resetting download for task %d\n", task.ID)
+			continue // Restart the loop to reset the download
+		}
+		if err != nil {
 			if err == io.EOF || status.State == "completed" || status.State == "canceled" {
 				activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
 				redistributeBandwidth(queue)
@@ -306,14 +312,18 @@ func tryDownload(task DownloadTask, controlChan chan ControlMessage, results cha
 	if err != nil {
 		return err
 	}
+	// Track if file is closed to avoid double-closing
+	fileClosed := false
 	defer func() {
-		if err := file.Close(); err != nil {
-			fmt.Printf("Error closing file %s: %v\n", fullPath, err)
+		if !fileClosed {
+			if err := file.Close(); err != nil {
+				fmt.Printf("Error closing file %s: %v\n", fullPath, err)
+			}
 		}
 		resp.Body.Close()
 	}()
 
-	return processDownload(task, file, resp, controlChan, results, status)
+	return processDownload(task, file, resp, controlChan, results, status, &fileClosed, fullPath)
 }
 
 func setupDownloadFile(task DownloadTask) (string, error) {
@@ -342,7 +352,7 @@ func initiateDownload(fullPath, url string) (*os.File, *http.Response, error) {
 	return file, resp, nil
 }
 
-func processDownload(task DownloadTask, file *os.File, resp *http.Response, controlChan chan ControlMessage, results chan<- DownloadStatus, status *DownloadStatus) error {
+func processDownload(task DownloadTask, file *os.File, resp *http.Response, controlChan chan ControlMessage, results chan<- DownloadStatus, status *DownloadStatus, fileClosed *bool, fullPath string) error {
 	status.TotalBytes = resp.ContentLength
 	status.HasTotalBytes = status.TotalBytes != -1
 	status.BytesInWindow = []int{}
@@ -357,10 +367,30 @@ func processDownload(task DownloadTask, file *os.File, resp *http.Response, cont
 		select {
 		case msg := <-controlChan:
 			if msg.TaskID == task.ID {
-				if err := handleControlMessage(status, task, file, task.FilePath, bytesDownloaded, status.TotalBytes, status.HasTotalBytes, controlChan, msg); err != nil {
+				if msg.Action == "reset" {
+					// Handle reset: clean up and signal to restart
+					*fileClosed = true
+					if err := file.Close(); err != nil {
+						fmt.Printf("Error closing file %s during reset: %v\n", fullPath, err)
+					}
+					if err := safeRemoveFile(fullPath); err != nil {
+						fmt.Printf("Error removing file %s during reset: %v\n", fullPath, err)
+					}
+					status.State = "reset"
+					status.Progress = 0
+					status.BytesDone = 0
+					status.BytesInWindow = []int{}
+					status.Timestamps = []time.Time{}
+					status.Speed = 0
+					status.ETA = "N/A"
+					updateProgressMap(task.FilePath, *status, 0, 0, status.TotalBytes, status.HasTotalBytes, 0, "N/A", "reset")
+					return fmt.Errorf("reset requested")
+				}
+				if err := handleControlMessage(status, task, file, fullPath, bytesDownloaded, status.TotalBytes, status.HasTotalBytes, controlChan, msg); err != nil {
 					return err
 				}
 				if status.State == "canceled" {
+					*fileClosed = true
 					results <- *status
 					return nil
 				}
@@ -374,12 +404,31 @@ func processDownload(task DownloadTask, file *os.File, resp *http.Response, cont
 					updateProgressMap(task.FilePath, *status, 100, bytesDownloaded, status.TotalBytes, status.HasTotalBytes, 0, "0s", "completed")
 					status.State = "completed"
 					results <- *status
+					*fileClosed = true
 					return nil
 				}
 				return fmt.Errorf("download chunk failed: %v", err)
 			}
 		}
 	}
+}
+
+func safeRemoveFile(filePath string) error {
+	//TODO 5 and 500 miliseconds
+	for i := 0; i < 5; i++ {
+		err := os.Remove(filePath)
+		if err == nil {
+			return nil
+		}
+		// Check if the error is due to the file being in use
+		if strings.Contains(err.Error(), "being used by another process") {
+			fmt.Printf("File %s in use, retrying removal (%d/%d)...\n", filePath, i+1, 5)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		return fmt.Errorf("failed to remove file %s: %v", filePath, err)
+	}
+	return fmt.Errorf("failed to remove file %s after %d attempts: file in use", filePath, 500*time.Millisecond)
 }
 
 func downloadChunk(task DownloadTask, file *os.File, body io.Reader, buffer []byte, status *DownloadStatus, bytesDownloaded, accumulatedBytes *int, lastUpdate *time.Time) error {
@@ -874,7 +923,7 @@ func processCommand(input string, pool *WorkerPool) bool {
 	}
 	parts := strings.Split(input, " ")
 	if len(parts) != 2 {
-		fmt.Println("Invalid command. Use 'pause ID', 'resume ID', or 'cancel ID'")
+		fmt.Println("Invalid command. Use 'pause ID', 'resume ID', 'cancel ID', or 'reset ID' (e.g., 'pause 1')")
 		return true
 	}
 	var taskID int
@@ -882,7 +931,12 @@ func processCommand(input string, pool *WorkerPool) bool {
 		fmt.Println("Invalid task ID. Must be a number.")
 		return true
 	}
-	sendControlMessage(taskID, parts[0])
+	action := parts[0]
+	if action != "pause" && action != "resume" && action != "cancel" && action != "reset" {
+		fmt.Println("Invalid action. Use 'pause', 'resume', 'cancel', or 'reset'.")
+		return true
+	}
+	sendControlMessage(taskID, action)
 	return true
 }
 
