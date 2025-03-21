@@ -1,15 +1,22 @@
 package download
 
 import (
-	"GoParallelDownload/internal/state"
-	"GoParallelDownload/pkg/types"
-	"GoParallelDownload/pkg/utils"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"GoParallelDownload/internal/state"
+	"GoParallelDownload/pkg/types"
+	"GoParallelDownload/pkg/utils"
+)
+
+const (
+	maxPartRetries    = 3 // Max retries for a single part
+	maxNetworkRetries = 5 // Max retries for network-related issues before canceling queue
+	retryDelay        = 5 * time.Second
 )
 
 func DownloadFile(task types.DownloadTask, controlChan chan types.ControlMessage, results chan<- types.DownloadStatus, queue *types.DownloadQueue) {
@@ -24,79 +31,78 @@ func DownloadFile(task types.DownloadTask, controlChan chan types.ControlMessage
 	utils.UpdateProgressMap(task.FilePath, status, 0, 0, 0, false, 0, "N/A", "pending")
 
 	for {
-		msg := <-controlChan
-		if msg.TaskID == task.ID || msg.QueueID == task.QueueID {
-			switch msg.Action {
-			case "resume":
-				if status.State == "pending" || status.State == "paused" {
-					status.State = "running"
-					utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "running")
-					state.ActiveTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
-					fmt.Printf("Task %d resumed in Queue %d\n", task.ID, queue.ID)
-					break
-				}
-				continue
-			case "pause":
-				if status.State == "running" {
-					status.State = "paused"
-					utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "paused")
+		select {
+		case msg := <-controlChan:
+			if msg.TaskID == task.ID || msg.QueueID == task.QueueID {
+				switch msg.Action {
+				case "resume":
+					if status.State == "pending" || status.State == "paused" {
+						status.State = "running"
+						utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "running")
+						state.ActiveTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
+						fmt.Printf("Task %d resumed in Queue %d\n", task.ID, queue.ID)
+					}
+				case "pause":
+					if status.State == "running" {
+						status.State = "paused"
+						utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "paused")
+						state.ActiveTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+						fmt.Printf("Task %d paused in Queue %d\n", task.ID, queue.ID)
+					}
+				case "cancel":
 					state.ActiveTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-					fmt.Printf("Task %d paused in Queue %d\n", task.ID, queue.ID)
+					status.State = "canceled"
+					utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, 0, "N/A", "canceled")
+					results <- status
+					utils.CleanupTaskParts(task, queue)
+					fmt.Printf("Task %d canceled in Queue %d\n", task.ID, queue.ID)
+					return
+				case "reset":
+					if status.State != "pending" {
+						state.ActiveTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+						status.State = "pending"
+						utils.UpdateProgressMap(task.FilePath, status, 0, 0, 0, false, 0, "N/A", "pending")
+						fmt.Printf("Task %d reset in Queue %d\n", task.ID, queue.ID)
+					}
 				}
+			}
+		default:
+			if status.State != "running" {
+				time.Sleep(100 * time.Millisecond)
 				continue
-			case "cancel":
-				state.ActiveTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+			}
+
+			err := downloadMultipart(task, controlChan, results, queue, &status, retriesLeft)
+			if err != nil {
+				if err == io.EOF || status.State == "completed" || status.State == "canceled" {
+					if status.State == "completed" {
+						state.ActiveTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+						results <- status
+						fmt.Printf("Task %d completed in Queue %d\n", task.ID, queue.ID)
+					} else {
+						results <- status
+					}
+					return
+				}
+				retriesLeft--
+				status.Error = err
+				status.State = "failed"
+				utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "failed")
+				if retriesLeft >= 0 {
+					fmt.Printf("Download failed for %s: %v. Retries left: %d. Retrying in %v...\n", task.URL, err, retriesLeft, retryDelay)
+					time.Sleep(retryDelay)
+					continue
+				}
+				fmt.Printf("Max retries reached for %s. Canceling download.\n", task.URL)
+				controlChan <- types.ControlMessage{TaskID: task.ID, Action: "cancel"}
 				status.State = "canceled"
-				utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, 0, "N/A", "canceled")
+				status.Error = fmt.Errorf("download canceled after %d failed attempts: %v", queue.MaxRetries+1, err)
 				results <- status
 				utils.CleanupTaskParts(task, queue)
-				fmt.Printf("Task %d canceled in Queue %d\n", task.ID, queue.ID)
-				return
-			case "reset":
-				if status.State != "pending" {
-					state.ActiveTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-					status.State = "pending"
-					utils.UpdateProgressMap(task.FilePath, status, 0, 0, 0, false, 0, "N/A", "pending")
-					fmt.Printf("Task %d reset in Queue %d\n", task.ID, queue.ID)
-				}
-				continue
-			}
-		}
-
-		if status.State != "running" {
-			continue
-		}
-
-		err := downloadMultipart(task, controlChan, results, queue, &status, retriesLeft)
-		if err != nil {
-			if err == io.EOF || status.State == "completed" || status.State == "canceled" {
-				if status.State == "completed" {
-					state.ActiveTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-					results <- status
-					fmt.Printf("Task %d completed in Queue %d\n", task.ID, queue.ID)
-				} else {
-					results <- status
-				}
 				return
 			}
-			retriesLeft--
-			status.Error = err
-			status.State = "failed"
-			utils.UpdateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "failed")
-			if retriesLeft >= 0 {
-				fmt.Printf("Multipart download failed for %s: %v. Retries left: %d. Retrying in %v...\n", task.URL, err, retriesLeft, utils.RetryDelay)
-				time.Sleep(utils.RetryDelay)
-				continue
-			}
-			fmt.Printf("Max retries reached for %s. Canceling download.\n", task.URL)
-			controlChan <- types.ControlMessage{TaskID: task.ID, Action: "cancel"}
-			status.State = "canceled"
-			status.Error = fmt.Errorf("download canceled after %d failed attempts: %v", queue.MaxRetries+1, err)
-			results <- status
-			utils.CleanupTaskParts(task, queue)
 			return
 		}
-		return
 	}
 }
 
@@ -114,7 +120,8 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 
 	finalPath, err := utils.SetupDownloadFile(task, queue)
 	if err != nil {
-		return err
+		fmt.Printf("Failed to setup download file for %s: %v. Retrying task.\n", task.URL, err)
+		return err // Retry at task level
 	}
 
 	partSize := totalSize / int64(types.NumParts)
@@ -136,16 +143,32 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 	partResults := make(chan types.DownloadStatus, types.NumParts)
 	partErrors := make(chan error, types.NumParts)
 	partControlChans := make([]chan types.ControlMessage, types.NumParts)
+	partRetries := make([]int, types.NumParts) // Track retries per part
 
 	for i := range parts {
+		partRetries[i] = maxPartRetries
 		partControlChans[i] = make(chan types.ControlMessage, 10)
 		wg.Add(1)
 		go func(partNum int) {
 			defer wg.Done()
-			err := downloadPart(task, partNum, parts[partNum].Start, parts[partNum].End,
-				parts[partNum].Path, partControlChans[partNum], partResults, queue)
-			if err != nil {
-				partErrors <- err
+			for partRetries[partNum] >= 0 {
+				err := downloadPart(task, partNum, parts[partNum].Start, parts[partNum].End,
+					parts[partNum].Path, partControlChans[partNum], partResults, queue)
+				if err == nil {
+					return // Part succeeded
+				}
+				partRetries[partNum]--
+				if partRetries[partNum] >= 0 {
+					fmt.Printf("Part %d of %s failed: %v. Retries left: %d. Resetting and retrying in %v...\n",
+						partNum, task.URL, err, partRetries[partNum], retryDelay)
+					if err := os.Remove(parts[partNum].Path); err != nil && !os.IsNotExist(err) {
+						fmt.Printf("Failed to clean up failed part %s: %v\n", parts[partNum].Path, err)
+					}
+					time.Sleep(retryDelay)
+					continue
+				}
+				partErrors <- fmt.Errorf("part %d failed after %d retries: %v", partNum, maxPartRetries, err)
+				return
 			}
 		}(i)
 	}
@@ -219,16 +242,22 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 
 	if len(partErrors) > 0 {
 		err := <-partErrors
-		return fmt.Errorf("part download failed: %v", err)
+		fmt.Printf("Multipart download aborted for %s: %v\n", task.URL, err)
+		return err // Trigger task-level retry or cancellation
 	}
 
 	if completedParts == types.NumParts {
-		err = utils.MergeParts(finalPath, parts)
-		if err != nil {
-			return fmt.Errorf("failed to merge parts: %v", err)
+		if err := utils.MergeParts(finalPath, parts); err != nil {
+			fmt.Printf("Failed to merge parts for %s: %v. Retrying task.\n", task.URL, err)
+			for _, part := range parts {
+				os.Remove(part.Path) // Clean up parts
+			}
+			return err // Retry at task level
 		}
 		for _, part := range parts {
-			os.Remove(part.Path)
+			if err := os.Remove(part.Path); err != nil && !os.IsNotExist(err) {
+				fmt.Printf("Warning: Failed to remove part %s: %v\n", part.Path, err)
+			}
 		}
 		status.State = "completed"
 		status.Progress = 100
@@ -244,141 +273,186 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 func downloadPart(task types.DownloadTask, partNum int, start, end int64, partPath string, controlChan chan types.ControlMessage, results chan<- types.DownloadStatus, queue *types.DownloadQueue) error {
 	req, err := http.NewRequest("GET", task.URL, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create request: %v", err)
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("server returned %s, expected 206 Partial Content", resp.Status)
-	}
-
-	file, err := os.Create(partPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	partStatus := types.DownloadStatus{
-		ID:            task.ID,
-		URL:           task.URL,
-		TotalBytes:    end - start + 1,
-		HasTotalBytes: true,
-		State:         "running",
-		PartID:        partNum,
-		BytesInWindow: []int{},
-		Timestamps:    []time.Time{},
-	}
-
-	bytesDownloaded := 0
-	accumulatedBytes := 0
-	lastUpdate := time.Now()
-	buffer := make([]byte, types.TokenSize)
-	paused := false
-
-	for {
-		select {
-		case msg := <-controlChan:
-			switch msg.Action {
-			case "pause":
-				if partStatus.State == "running" {
-					partStatus.State = "paused"
-					paused = true
-					utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
-						partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true,
-						partStatus.Speed, partStatus.ETA, "paused")
-				}
-			case "resume":
-				if partStatus.State == "paused" {
-					partStatus.State = "running"
-					paused = false
-					utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
-						partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true,
-						partStatus.Speed, partStatus.ETA, "running")
-				}
-			case "cancel":
-				file.Close()
-				os.Remove(partPath)
-				partStatus.State = "canceled"
-				results <- partStatus
-				return nil
-			case "reset":
-				file.Close()
-				os.Remove(partPath)
-				partStatus.State = "reset"
-				return fmt.Errorf("reset requested")
-			}
-		default:
-			if paused || partStatus.State != "running" {
-				time.Sleep(100 * time.Millisecond)
+	networkRetries := maxNetworkRetries
+	for networkRetries > 0 {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			networkRetries--
+			if networkRetries > 0 {
+				fmt.Printf("Network error downloading part %d of %s: %v. Retries left: %d. Retrying in %v...\n",
+					partNum, task.URL, err, networkRetries, retryDelay)
+				time.Sleep(retryDelay)
 				continue
 			}
+			return fmt.Errorf("network failed after %d retries: %v", maxNetworkRetries, err)
+		}
+		defer resp.Body.Close()
 
-			queue.TokenBucket.WaitForTokens(float64(types.TokenSize))
-			n, err := resp.Body.Read(buffer)
-			if n > 0 {
-				if _, err := file.Write(buffer[:n]); err != nil {
-					return err
-				}
-				bytesDownloaded += n
-				accumulatedBytes += n
-				utils.UpdateRollingWindow(&partStatus.BytesInWindow, &partStatus.Timestamps, n, time.Now())
-				if accumulatedBytes >= utils.UpdateIntervalBytes || time.Since(lastUpdate) >= utils.UpdateIntervalTime {
-					progress := utils.CalculateProgress(bytesDownloaded, partStatus.TotalBytes, true)
-					speed, eta := utils.CalculateSpeedAndETA(partStatus.BytesInWindow, partStatus.Timestamps,
-						bytesDownloaded, partStatus.TotalBytes, true)
-					utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
-						progress, bytesDownloaded, partStatus.TotalBytes, true, speed, eta, "running")
-					partStatus.Progress = progress
-					partStatus.Speed = speed
-					partStatus.ETA = eta
-					partStatus.BytesDone = bytesDownloaded
-					results <- partStatus
-					accumulatedBytes = 0
-					lastUpdate = time.Now()
-				}
-			}
-			if err != nil {
-				if err == io.EOF {
-					partStatus.State = "completed"
-					partStatus.Progress = 100
-					partStatus.BytesDone = bytesDownloaded
-					utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
-						100, bytesDownloaded, partStatus.TotalBytes, true, 0, "0s", "completed")
+		if resp.StatusCode != http.StatusPartialContent {
+			return fmt.Errorf("server returned %s, expected 206 Partial Content", resp.Status)
+		}
+
+		file, err := os.Create(partPath)
+		if err != nil {
+			return fmt.Errorf("failed to create part file %s: %v", partPath, err)
+		}
+		defer file.Close()
+
+		partStatus := types.DownloadStatus{
+			ID:            task.ID,
+			URL:           task.URL,
+			TotalBytes:    end - start + 1,
+			HasTotalBytes: true,
+			State:         "running",
+			PartID:        partNum,
+			BytesInWindow: []int{},
+			Timestamps:    []time.Time{},
+		}
+
+		bytesDownloaded := 0
+		accumulatedBytes := 0
+		lastUpdate := time.Now()
+		buffer := make([]byte, types.TokenSize)
+		paused := false
+
+		for {
+			select {
+			case msg := <-controlChan:
+				switch msg.Action {
+				case "pause":
+					if partStatus.State == "running" {
+						partStatus.State = "paused"
+						paused = true
+						utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+							partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true,
+							partStatus.Speed, partStatus.ETA, "paused")
+					}
+				case "resume":
+					if partStatus.State == "paused" {
+						partStatus.State = "running"
+						paused = false
+						utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+							partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true,
+							partStatus.Speed, partStatus.ETA, "running")
+					}
+				case "cancel":
+					file.Close()
+					os.Remove(partPath)
+					partStatus.State = "canceled"
 					results <- partStatus
 					return nil
+				case "reset":
+					file.Close()
+					os.Remove(partPath)
+					partStatus.State = "reset"
+					return fmt.Errorf("reset requested")
 				}
-				return err
+			default:
+				if paused || partStatus.State != "running" {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+
+				queue.TokenBucket.WaitForTokens(float64(types.TokenSize))
+				n, err := resp.Body.Read(buffer)
+				if n > 0 {
+					if _, err := file.Write(buffer[:n]); err != nil {
+						return fmt.Errorf("failed to write to part %s: %v", partPath, err)
+					}
+					bytesDownloaded += n
+					accumulatedBytes += n
+					utils.UpdateRollingWindow(&partStatus.BytesInWindow, &partStatus.Timestamps, n, time.Now())
+					if accumulatedBytes >= utils.UpdateIntervalBytes || time.Since(lastUpdate) >= utils.UpdateIntervalTime {
+						progress := utils.CalculateProgress(bytesDownloaded, partStatus.TotalBytes, true)
+						speed, eta := utils.CalculateSpeedAndETA(partStatus.BytesInWindow, partStatus.Timestamps,
+							bytesDownloaded, partStatus.TotalBytes, true)
+						utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+							progress, bytesDownloaded, partStatus.TotalBytes, true, speed, eta, "running")
+						partStatus.Progress = progress
+						partStatus.Speed = speed
+						partStatus.ETA = eta
+						partStatus.BytesDone = bytesDownloaded
+						results <- partStatus
+						accumulatedBytes = 0
+						lastUpdate = time.Now()
+					}
+				}
+				if err != nil {
+					if err == io.EOF {
+						partStatus.State = "completed"
+						partStatus.Progress = 100
+						partStatus.BytesDone = bytesDownloaded
+						utils.UpdateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+							100, bytesDownloaded, partStatus.TotalBytes, true, 0, "0s", "completed")
+						results <- partStatus
+						return nil
+					}
+					return fmt.Errorf("read error: %v", err)
+				}
 			}
 		}
 	}
+	return fmt.Errorf("unexpected exit from network retry loop")
 }
 
 func tryDownload(task types.DownloadTask, controlChan chan types.ControlMessage, results chan<- types.DownloadStatus, status *types.DownloadStatus, queue *types.DownloadQueue) error {
 	fullPath, err := utils.SetupDownloadFile(task, queue)
 	if err != nil {
+		fmt.Printf("Failed to setup file %s: %v. Retrying task.\n", task.URL, err)
 		return err
 	}
 
-	file, resp, err := initiateDownload(fullPath, task.URL)
-	if err != nil {
-		return err
-	}
-	fileClosed := false
-	defer func() {
-		if !fileClosed {
+	networkRetries := maxNetworkRetries
+	for networkRetries > 0 {
+		file, resp, err := initiateDownload(fullPath, task.URL)
+		if err != nil {
+			networkRetries--
+			if networkRetries > 0 {
+				fmt.Printf("Failed to initiate download %s: %v. Retries left: %d. Retrying in %v...\n",
+					task.URL, err, networkRetries, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+			fmt.Printf("Network failed for %s after %d retries. Canceling task.\n", task.URL, maxNetworkRetries)
+			return fmt.Errorf("network failed after %d retries: %v", maxNetworkRetries, err)
+		}
+
+		fileClosed := false
+		defer func() {
+			if !fileClosed {
+				if err := file.Close(); err != nil {
+					fmt.Printf("Error closing file %s: %v\n", fullPath, err)
+				}
+			}
+			resp.Body.Close()
+		}()
+
+		err = processDownload(task, file, resp, controlChan, results, status, &fileClosed, fullPath, queue)
+		if err == nil || status.State == "canceled" {
+			return err // Success or canceled
+		}
+		networkRetries--
+		if networkRetries > 0 {
+			fmt.Printf("Single-file download %s failed: %v. Retries left: %d. Retrying in %v...\n",
+				task.URL, err, networkRetries, retryDelay)
 			if err := file.Close(); err != nil {
 				fmt.Printf("Error closing file %s: %v\n", fullPath, err)
 			}
+			fileClosed = true
+			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+				fmt.Printf("Failed to clean up %s: %v\n", fullPath, err)
+			}
+			time.Sleep(retryDelay)
+			continue
 		}
-		resp.Body.Close()
-	}()
-
-	return processDownload(task, file, resp, controlChan, results, status, &fileClosed, fullPath, queue)
+		fmt.Printf("Max retries reached for %s. Canceling task.\n", task.URL)
+		return fmt.Errorf("failed after %d retries: %v", maxNetworkRetries, err)
+	}
+	return fmt.Errorf("unexpected exit from retry loop")
 }
 
 func initiateDownload(fullPath, url string) (*os.File, *http.Response, error) {
@@ -496,7 +570,7 @@ func handleControlMessage(status *types.DownloadStatus, task types.DownloadTask,
 					return nil
 				} else if resumeMsg.Action == "cancel" {
 					file.Close()
-					if err := os.Remove(fullPath); err != nil {
+					if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 						return fmt.Errorf("failed to remove file %s during cancel: %v", fullPath, err)
 					}
 					state.ProgressMux.Lock()
@@ -509,7 +583,7 @@ func handleControlMessage(status *types.DownloadStatus, task types.DownloadTask,
 		}
 	case "cancel":
 		file.Close()
-		if err := os.Remove(fullPath); err != nil {
+		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove file %s during cancel: %v", fullPath, err)
 		}
 		state.ProgressMux.Lock()
