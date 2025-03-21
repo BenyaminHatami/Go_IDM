@@ -373,19 +373,41 @@ func downloadMultipart(task DownloadTask, controlChan chan ControlMessage, resul
 	var wg sync.WaitGroup
 	partResults := make(chan DownloadStatus, numParts)
 	partErrors := make(chan error, numParts)
+	partControlChans := make([]chan ControlMessage, numParts) // Control channels for each part
+
+	// Create control channels for each part and start downloads
 	for i := range parts {
+		partControlChans[i] = make(chan ControlMessage, 10)
 		wg.Add(1)
 		go func(partNum int) {
 			defer wg.Done()
-			err := downloadPart(task, partNum, parts[partNum].start, parts[partNum].end, parts[partNum].path, controlChan, partResults, queue)
+			err := downloadPart(task, partNum, parts[partNum].start, parts[partNum].end,
+				parts[partNum].path, partControlChans[partNum], partResults, queue)
 			if err != nil {
 				partErrors <- err
 			}
 		}(i)
 	}
 
+	// Handle main control messages and broadcast to parts
+	go func() {
+		for msg := range controlChan {
+			// Broadcast to all parts
+			for _, partChan := range partControlChans {
+				partChan <- msg
+			}
+			if msg.Action == "cancel" {
+				break
+			}
+		}
+	}()
+
 	go func() {
 		wg.Wait()
+		// Close all part control channels after completion
+		for _, ch := range partControlChans {
+			close(ch)
+		}
 		close(partResults)
 		close(partErrors)
 	}()
@@ -498,49 +520,46 @@ func downloadPart(task DownloadTask, partNum int, start, end int64, partPath str
 	accumulatedBytes := 0
 	lastUpdate := time.Now()
 	buffer := make([]byte, tokenSize)
+	paused := false
 
 	for {
 		select {
 		case msg := <-controlChan:
-			if msg.TaskID == task.ID || msg.QueueID == task.QueueID {
-				switch msg.Action {
-				case "pause":
+			switch msg.Action {
+			case "pause":
+				if partStatus.State == "running" {
 					partStatus.State = "paused"
-					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true, partStatus.Speed, partStatus.ETA, "paused")
-					for {
-						resumeMsg := <-controlChan
-						if resumeMsg.TaskID == task.ID || resumeMsg.QueueID == task.QueueID {
-							if resumeMsg.Action == "resume" {
-								partStatus.State = "running"
-								updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true, partStatus.Speed, partStatus.ETA, "running")
-								break
-							} else if resumeMsg.Action == "cancel" {
-								file.Close()
-								os.Remove(partPath)
-								partStatus.State = "canceled"
-								results <- partStatus
-								return nil
-							}
-						}
-					}
-				case "cancel":
-					file.Close()
-					os.Remove(partPath)
-					partStatus.State = "canceled"
-					results <- partStatus
-					return nil
-				case "reset":
-					file.Close()
-					os.Remove(partPath)
-					partStatus.State = "reset"
-					return fmt.Errorf("reset requested")
+					paused = true
+					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+						partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true,
+						partStatus.Speed, partStatus.ETA, "paused")
 				}
+			case "resume":
+				if partStatus.State == "paused" {
+					partStatus.State = "running"
+					paused = false
+					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+						partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true,
+						partStatus.Speed, partStatus.ETA, "running")
+				}
+			case "cancel":
+				file.Close()
+				os.Remove(partPath)
+				partStatus.State = "canceled"
+				results <- partStatus
+				return nil
+			case "reset":
+				file.Close()
+				os.Remove(partPath)
+				partStatus.State = "reset"
+				return fmt.Errorf("reset requested")
 			}
 		default:
-			if partStatus.State != "running" {
+			if paused || partStatus.State != "running" {
+				time.Sleep(100 * time.Millisecond) // Reduce CPU usage while paused
 				continue
 			}
-			// Use queue-level TokenBucket to enforce total limit
+
 			queue.TokenBucket.WaitForTokens(float64(tokenSize))
 			n, err := resp.Body.Read(buffer)
 			if n > 0 {
@@ -552,8 +571,10 @@ func downloadPart(task DownloadTask, partNum int, start, end int64, partPath str
 				updateRollingWindow(&partStatus.BytesInWindow, &partStatus.Timestamps, n, time.Now())
 				if accumulatedBytes >= updateIntervalBytes || time.Since(lastUpdate) >= updateIntervalTime {
 					progress := calculateProgress(bytesDownloaded, partStatus.TotalBytes, true)
-					speed, eta := calculateSpeedAndETA(partStatus.BytesInWindow, partStatus.Timestamps, bytesDownloaded, partStatus.TotalBytes, true)
-					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, progress, bytesDownloaded, partStatus.TotalBytes, true, speed, eta, "running")
+					speed, eta := calculateSpeedAndETA(partStatus.BytesInWindow, partStatus.Timestamps,
+						bytesDownloaded, partStatus.TotalBytes, true)
+					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+						progress, bytesDownloaded, partStatus.TotalBytes, true, speed, eta, "running")
 					partStatus.Progress = progress
 					partStatus.Speed = speed
 					partStatus.ETA = eta
@@ -568,7 +589,8 @@ func downloadPart(task DownloadTask, partNum int, start, end int64, partPath str
 					partStatus.State = "completed"
 					partStatus.Progress = 100
 					partStatus.BytesDone = bytesDownloaded
-					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, 100, bytesDownloaded, partStatus.TotalBytes, true, 0, "0s", "completed")
+					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus,
+						100, bytesDownloaded, partStatus.TotalBytes, true, 0, "0s", "completed")
 					results <- partStatus
 					return nil
 				}
@@ -1073,14 +1095,17 @@ func updateQueueSpeedLimit(queueID int, newSpeedLimit float64) {
 func checkQueueTimeWindow(queue *DownloadQueue) {
 	now := time.Now()
 	withinTimeWindow := true
+	startTime := queue.StartTime
+	stopTime := queue.StopTime
+
 	if queue.StartTime != nil {
-		startToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StartTime.Hour(), queue.StartTime.Minute(), 0, 0, time.Local)
+		startToday := time.Date(startTime.Year(), startTime.Month(), startTime.Day(), startTime.Hour(), startTime.Minute(), startTime.Second(), 0, time.Local)
 		if now.Before(startToday) {
 			withinTimeWindow = false
 		}
 	}
 	if queue.StopTime != nil {
-		stopToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StopTime.Hour(), queue.StopTime.Minute(), 0, 0, time.Local)
+		stopToday := time.Date(stopTime.Year(), stopTime.Month(), stopTime.Day(), stopTime.Hour(), stopTime.Minute(), stopTime.Second(), 0, time.Local)
 		if now.After(stopToday) {
 			withinTimeWindow = false
 		}
@@ -1203,30 +1228,6 @@ func updateQueueRetries(queueID, retries int) {
 	} else {
 		fmt.Printf("Queue %d not found\n", queueID)
 	}
-}
-
-func setupDownloadQueues() []*DownloadQueue {
-	queuesList := []*DownloadQueue{
-		{
-			Tasks: []DownloadTask{
-				{ID: 1, URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
-				{ID: 2, URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
-				{ID: 3, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
-			},
-			SpeedLimit:       float64(totalBandwidthLimit),
-			ConcurrentLimit:  2,
-			StartTime:        nil,
-			StopTime:         nil,
-			MaxRetries:       3,
-			ID:               1,
-			DownloadLocation: "C:/CustomDownloads",
-		},
-	}
-	for i := range queuesList {
-		setFileNames(queuesList[i].Tasks)
-		setFileType(queuesList[i].Tasks)
-	}
-	return queuesList
 }
 
 func startProgressDisplay(wg *sync.WaitGroup) {
@@ -1391,12 +1392,82 @@ func reportDownloadResult(result DownloadStatus) {
 	}
 }
 
+func setupDownloadQueues() []*DownloadQueue {
+	queuesList := []*DownloadQueue{
+		{
+			Tasks: []DownloadTask{
+				/*				{ID: 1, URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
+								{ID: 2, URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
+								{ID: 3, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},*/
+				//{ID: 4, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
+				{ID: 4, URL: "https://example.com/file3.mp3"},
+			},
+			SpeedLimit:       float64(400 * 1024), // 500 KB/s
+			ConcurrentLimit:  2,
+			StartTime:        nil,
+			StopTime:         nil,
+			MaxRetries:       2,
+			ID:               1,
+			DownloadLocation: "C:/CustomDownloads", // Example custom location
+		},
+		{
+			Tasks: []DownloadTask{
+				{ID: 6, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
+				{ID: 7, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
+			},
+			SpeedLimit:       float64(totalBandwidthLimit) * 0.4, // 200 KB/s
+			ConcurrentLimit:  2,
+			StartTime:        nil,
+			StopTime:         nil,
+			MaxRetries:       2,
+			ID:               2,
+			DownloadLocation: "D:/AnotherLocation", // Another example custom location
+		},
+	}
+	for i := range queuesList {
+		setFileNames(queuesList[i].Tasks)
+		setFileType(queuesList[i].Tasks)
+	}
+	return queuesList
+}
+
 func applyHardcodedSpeedChanges() {
 	go func() {
-		time.Sleep(3 * time.Second)
+		time.Sleep(2 * time.Second)
 		sendQueueControlMessage(1, "resume")
-		fmt.Println("Queue 1 all tasks resumed after 18 seconds")
+		sendQueueControlMessage(2, "resume")
+		fmt.Println("Queue 1 all tasks resumed after 2 seconds")
+
+		time.Sleep(8 * time.Second)
+		sendQueueControlMessage(2, "pause")
+		updateQueueSpeedLimit(1, 500*1024)
+		fmt.Println("Queue 1 speed limit updated to 600 KB/s after 7 seconds")
+
+		time.Sleep(5 * time.Second)
+		sendQueueControlMessage(2, "resume")
+		now := time.Now()
+		startTime := now
+		stopTime := now.Add(3 * time.Minute)
+		updateQueueTimeInterval(1, &startTime, &stopTime)
+		fmt.Println("Queue 1 time interval updated to now-now+3min after 12 seconds")
+
+		time.Sleep(5 * time.Second)
+		updateQueueRetries(1, 5)
+		fmt.Println("Queue 1 max retries updated to 5 after 17 seconds")
+
+		time.Sleep(5 * time.Second)
+		updateQueueSpeedLimit(1, 800*1024)
+		fmt.Println("Queue 1 speed limit updated to 700 KB/s after 22 seconds")
+
+		time.Sleep(5 * time.Second)
+		sendQueueControlMessage(1, "pause")
+		fmt.Println("Queue 1 all tasks paused after 27 seconds")
+
+		time.Sleep(5 * time.Second)
+		sendQueueControlMessage(1, "resume")
+		fmt.Println("Queue 1 all tasks resumed again after 32 seconds")
 	}()
+
 }
 
 func main() {
