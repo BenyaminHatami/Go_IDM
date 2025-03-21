@@ -19,27 +19,27 @@ import (
 
 // DownloadTask represents a single download task
 type DownloadTask struct {
-	ID          int
-	URL         string
-	FilePath    string
-	FileType    string
-	TokenBucket *TokenBucket
-	QueueID     int
+	ID       int
+	URL      string
+	FilePath string
+	FileType string
+	QueueID  int
 }
 
 // DownloadQueue represents a queue of download tasks with its own limits
 type DownloadQueue struct {
 	Tasks            []DownloadTask
-	SpeedLimit       float64    // Bandwidth limit in bytes/sec
-	ConcurrentLimit  int        // Max simultaneous downloads
-	StartTime        *time.Time // Start time for downloads (nil means no start restriction)
-	StopTime         *time.Time // Stop time for downloads (nil means no stop restriction)
-	MaxRetries       int        // Maximum number of retries for failed downloads
-	ID               int        // Unique ID for each queue
-	DownloadLocation string     // Custom download location for this queue
+	SpeedLimit       float64      // Total bandwidth limit in bytes/sec (e.g., 500 KB/s)
+	ConcurrentLimit  int          // Max simultaneous downloads
+	StartTime        *time.Time   // Start time for downloads (nil means no start restriction)
+	StopTime         *time.Time   // Stop time for downloads (nil means no stop restriction)
+	MaxRetries       int          // Maximum number of retries for failed downloads
+	ID               int          // Unique ID for each queue
+	DownloadLocation string       // Custom download location for this queue
+	TokenBucket      *TokenBucket // Queue-level bandwidth control
 }
 
-// DownloadStatus represents the status of a download
+// DownloadStatus represents the status of a download (or a part)
 type DownloadStatus struct {
 	ID            int
 	URL           string
@@ -54,6 +54,7 @@ type DownloadStatus struct {
 	Timestamps    []time.Time
 	Error         error
 	RetriesLeft   int
+	PartID        int // For multipart downloads, -1 if whole file
 }
 
 // ControlMessage represents a control command
@@ -65,31 +66,30 @@ type ControlMessage struct {
 
 // Constants
 const (
-	totalBandwidthLimit = 500 * 1024   // 500 KB/s total available bandwidth
-	tokenSize           = 1024         // 1 KB per token
+	totalBandwidthLimit = 500 * 1024   // 500 KB/s total available bandwidth for the queue
+	tokenSize           = 256          // Smaller token size for finer control (256 bytes)
 	subDirDownloads     = "Downloads/" // Subdirectory name
+	numParts            = 4            // Number of parts for multipart downloading
 
-	windowDuration      = 1 * time.Second        // Rolling window for speed calculation
-	updateIntervalBytes = 10 * 1024              // Update progressMap every 10 KB
-	updateIntervalTime  = 100 * time.Millisecond // Update progressMap every 100ms
-	refillInterval      = 10 * time.Millisecond  // Refill token bucket every 10ms
-	retryDelay          = 5 * time.Second        // Delay between retries
+	windowDuration      = 1 * time.Second
+	updateIntervalBytes = 10 * 1024
+	updateIntervalTime  = 100 * time.Millisecond
+	refillInterval      = 10 * time.Millisecond
+	retryDelay          = 5 * time.Second
 )
 
-// Global variables for progress tracking
+// Global variables
 var (
-	progressMap    = make(map[string]DownloadStatus)
-	progressMux    = sync.Mutex{}
-	controlChans   = make(map[int]chan ControlMessage)
-	controlMux     = sync.Mutex{}
-	stopDisplay    = make(chan struct{})
-	activeTasks    = sync.Map{}                   // Map[queueID:taskID]bool
-	queues         = make(map[int]*DownloadQueue) // Store queue pointers
-	bandwidthChans = make(map[int]chan struct{})
-	bandwidthMux   = sync.Mutex{}
+	progressMap  = make(map[string]DownloadStatus)
+	progressMux  = sync.Mutex{}
+	controlChans = make(map[int]chan ControlMessage)
+	controlMux   = sync.Mutex{}
+	stopDisplay  = make(chan struct{})
+	activeTasks  = sync.Map{}                   // Map[queueID:taskID]bool
+	queues       = make(map[int]*DownloadQueue) // Store queue pointers
 )
 
-// TokenBucket represents a token bucket system
+// TokenBucket implementation
 type TokenBucket struct {
 	mu             sync.Mutex
 	tokens         float64
@@ -246,17 +246,16 @@ func (p *WorkerPool) stop(wait bool) {
 
 func downloadFile(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, queue *DownloadQueue) {
 	retriesLeft := queue.MaxRetries
-	// Start in pending state
 	status := DownloadStatus{
 		ID:          task.ID,
 		URL:         task.URL,
 		State:       "pending",
 		RetriesLeft: retriesLeft,
+		PartID:      -1, // Whole file status
 	}
 	updateProgressMap(task.FilePath, status, 0, 0, 0, false, 0, "N/A", "pending")
 
 	for {
-		// Wait for "resume" to start or handle queue-level commands
 		msg := <-controlChan
 		if msg.TaskID == task.ID || msg.QueueID == task.QueueID {
 			switch msg.Action {
@@ -264,6 +263,8 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 				if status.State == "pending" || status.State == "paused" {
 					status.State = "running"
 					updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "running")
+					activeTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
+					fmt.Printf("Task %d resumed in Queue %d\n", task.ID, queue.ID)
 					break
 				}
 				continue
@@ -271,19 +272,24 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 				if status.State == "running" {
 					status.State = "paused"
 					updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "paused")
+					activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+					fmt.Printf("Task %d paused in Queue %d\n", task.ID, queue.ID)
 				}
 				continue
 			case "cancel":
+				activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
 				status.State = "canceled"
 				updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, 0, "N/A", "canceled")
 				results <- status
-				activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-				triggerBandwidthRedistribution(queue.ID)
+				cleanupTaskParts(task, queue)
+				fmt.Printf("Task %d canceled in Queue %d\n", task.ID, queue.ID)
 				return
 			case "reset":
 				if status.State != "pending" {
+					activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
 					status.State = "pending"
 					updateProgressMap(task.FilePath, status, 0, 0, 0, false, 0, "N/A", "pending")
+					fmt.Printf("Task %d reset in Queue %d\n", task.ID, queue.ID)
 				}
 				continue
 			}
@@ -293,18 +299,16 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 			continue
 		}
 
-		activeTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
-		triggerBandwidthRedistribution(queue.ID)
-
-		err := tryDownload(task, controlChan, results, &status)
-		if err != nil && status.State == "reset" {
-			fmt.Printf("Resetting download for task %d\n", task.ID)
-			continue
-		}
+		err := downloadMultipart(task, controlChan, results, queue, &status, retriesLeft)
 		if err != nil {
 			if err == io.EOF || status.State == "completed" || status.State == "canceled" {
-				activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-				triggerBandwidthRedistribution(queue.ID)
+				if status.State == "completed" {
+					activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+					results <- status
+					fmt.Printf("Task %d completed in Queue %d\n", task.ID, queue.ID)
+				} else {
+					results <- status
+				}
 				return
 			}
 			retriesLeft--
@@ -312,7 +316,7 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 			status.State = "failed"
 			updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "failed")
 			if retriesLeft >= 0 {
-				fmt.Printf("Download failed for %s: %v. Retries left: %d. Retrying in %v...\n", task.URL, err, retriesLeft, retryDelay)
+				fmt.Printf("Multipart download failed for %s: %v. Retries left: %d. Retrying in %v...\n", task.URL, err, retriesLeft, retryDelay)
 				time.Sleep(retryDelay)
 				continue
 			}
@@ -321,18 +325,285 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 			status.State = "canceled"
 			status.Error = fmt.Errorf("download canceled after %d failed attempts: %v", queue.MaxRetries+1, err)
 			results <- status
-			activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-			triggerBandwidthRedistribution(queue.ID)
+			cleanupTaskParts(task, queue)
 			return
 		}
-		activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-		triggerBandwidthRedistribution(queue.ID)
 		return
 	}
 }
 
-func tryDownload(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, status *DownloadStatus) error {
-	fullPath, err := setupDownloadFile(task, queues[task.QueueID])
+func downloadMultipart(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, queue *DownloadQueue, status *DownloadStatus, retriesLeft int) error {
+	resp, err := http.Head(task.URL)
+	if err != nil {
+		return fmt.Errorf("failed to HEAD %s: %v", task.URL, err)
+	}
+	defer resp.Body.Close()
+
+	totalSize := resp.ContentLength
+	if totalSize == -1 || resp.Header.Get("Accept-Ranges") != "bytes" {
+		return tryDownload(task, controlChan, results, status, queue)
+	}
+
+	finalPath, err := setupDownloadFile(task, queue)
+	if err != nil {
+		return err
+	}
+
+	partSize := totalSize / int64(numParts)
+	parts := make([]struct {
+		start, end int64
+		path       string
+	}, numParts)
+	for i := 0; i < numParts; i++ {
+		start := int64(i) * partSize
+		end := start + partSize - 1
+		if i == numParts-1 {
+			end = totalSize - 1
+		}
+		parts[i] = struct {
+			start, end int64
+			path       string
+		}{
+			start: start,
+			end:   end,
+			path:  fmt.Sprintf("%s.part%d", finalPath, i),
+		}
+	}
+
+	var wg sync.WaitGroup
+	partResults := make(chan DownloadStatus, numParts)
+	partErrors := make(chan error, numParts)
+	for i := range parts {
+		wg.Add(1)
+		go func(partNum int) {
+			defer wg.Done()
+			err := downloadPart(task, partNum, parts[partNum].start, parts[partNum].end, parts[partNum].path, controlChan, partResults, queue)
+			if err != nil {
+				partErrors <- err
+			}
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(partResults)
+		close(partErrors)
+	}()
+
+	var totalBytesDone int
+	var totalProgress int
+	partStatuses := make(map[int]DownloadStatus)
+	completedParts := 0
+	status.TotalBytes = totalSize
+	status.HasTotalBytes = true
+
+	for partStatus := range partResults {
+		partStatuses[partStatus.PartID] = partStatus
+		if partStatus.State == "completed" {
+			totalBytesDone += partStatus.BytesDone
+			totalProgress += partStatus.Progress / numParts
+			completedParts++
+		}
+
+		totalSpeed := 0
+		for i := 0; i < numParts; i++ {
+			if ps, ok := partStatuses[i]; ok {
+				totalSpeed += ps.Speed
+			}
+		}
+
+		eta := "N/A"
+		if totalSpeed > 0 && status.HasTotalBytes {
+			remainingBytes := totalSize - int64(totalBytesDone)
+			if remainingBytes <= 0 {
+				eta = "0s"
+			} else {
+				etaSeconds := float64(remainingBytes) / float64(totalSpeed*1024)
+				eta = time.Duration(etaSeconds * float64(time.Second)).Truncate(time.Second).String()
+			}
+		}
+
+		updateProgressMap(task.FilePath, DownloadStatus{
+			ID:            task.ID,
+			URL:           task.URL,
+			Progress:      totalProgress,
+			BytesDone:     totalBytesDone,
+			TotalBytes:    totalSize,
+			HasTotalBytes: true,
+			State:         "running",
+			Speed:         totalSpeed,
+			ETA:           eta,
+			PartID:        -1,
+		}, totalProgress, totalBytesDone, totalSize, true, totalSpeed, eta, "running")
+	}
+
+	if len(partErrors) > 0 {
+		err := <-partErrors
+		return fmt.Errorf("part download failed: %v", err)
+	}
+
+	if completedParts == numParts {
+		err = mergeParts(finalPath, parts)
+		if err != nil {
+			return fmt.Errorf("failed to merge parts: %v", err)
+		}
+		for _, part := range parts {
+			os.Remove(part.path)
+		}
+		status.State = "completed"
+		status.Progress = 100
+		status.BytesDone = int(totalSize)
+		updateProgressMap(task.FilePath, *status, 100, int(totalSize), totalSize, true, 0, "0s", "completed")
+		results <- *status
+		return nil
+	}
+
+	return fmt.Errorf("incomplete download: only %d of %d parts completed", completedParts, numParts)
+}
+
+func downloadPart(task DownloadTask, partNum int, start, end int64, partPath string, controlChan chan ControlMessage, results chan<- DownloadStatus, queue *DownloadQueue) error {
+	req, err := http.NewRequest("GET", task.URL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("server returned %s, expected 206 Partial Content", resp.Status)
+	}
+
+	file, err := os.Create(partPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	partStatus := DownloadStatus{
+		ID:            task.ID,
+		URL:           task.URL,
+		TotalBytes:    end - start + 1,
+		HasTotalBytes: true,
+		State:         "running",
+		PartID:        partNum,
+		BytesInWindow: []int{},
+		Timestamps:    []time.Time{},
+	}
+
+	bytesDownloaded := 0
+	accumulatedBytes := 0
+	lastUpdate := time.Now()
+	buffer := make([]byte, tokenSize)
+
+	for {
+		select {
+		case msg := <-controlChan:
+			if msg.TaskID == task.ID || msg.QueueID == task.QueueID {
+				switch msg.Action {
+				case "pause":
+					partStatus.State = "paused"
+					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true, partStatus.Speed, partStatus.ETA, "paused")
+					for {
+						resumeMsg := <-controlChan
+						if resumeMsg.TaskID == task.ID || resumeMsg.QueueID == task.QueueID {
+							if resumeMsg.Action == "resume" {
+								partStatus.State = "running"
+								updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, partStatus.Progress, bytesDownloaded, partStatus.TotalBytes, true, partStatus.Speed, partStatus.ETA, "running")
+								break
+							} else if resumeMsg.Action == "cancel" {
+								file.Close()
+								os.Remove(partPath)
+								partStatus.State = "canceled"
+								results <- partStatus
+								return nil
+							}
+						}
+					}
+				case "cancel":
+					file.Close()
+					os.Remove(partPath)
+					partStatus.State = "canceled"
+					results <- partStatus
+					return nil
+				case "reset":
+					file.Close()
+					os.Remove(partPath)
+					partStatus.State = "reset"
+					return fmt.Errorf("reset requested")
+				}
+			}
+		default:
+			if partStatus.State != "running" {
+				continue
+			}
+			// Use queue-level TokenBucket to enforce total limit
+			queue.TokenBucket.WaitForTokens(float64(tokenSize))
+			n, err := resp.Body.Read(buffer)
+			if n > 0 {
+				if _, err := file.Write(buffer[:n]); err != nil {
+					return err
+				}
+				bytesDownloaded += n
+				accumulatedBytes += n
+				updateRollingWindow(&partStatus.BytesInWindow, &partStatus.Timestamps, n, time.Now())
+				if accumulatedBytes >= updateIntervalBytes || time.Since(lastUpdate) >= updateIntervalTime {
+					progress := calculateProgress(bytesDownloaded, partStatus.TotalBytes, true)
+					speed, eta := calculateSpeedAndETA(partStatus.BytesInWindow, partStatus.Timestamps, bytesDownloaded, partStatus.TotalBytes, true)
+					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, progress, bytesDownloaded, partStatus.TotalBytes, true, speed, eta, "running")
+					partStatus.Progress = progress
+					partStatus.Speed = speed
+					partStatus.ETA = eta
+					partStatus.BytesDone = bytesDownloaded
+					results <- partStatus
+					accumulatedBytes = 0
+					lastUpdate = time.Now()
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					partStatus.State = "completed"
+					partStatus.Progress = 100
+					partStatus.BytesDone = bytesDownloaded
+					updateProgressMap(fmt.Sprintf("%s.part%d", task.FilePath, partNum), partStatus, 100, bytesDownloaded, partStatus.TotalBytes, true, 0, "0s", "completed")
+					results <- partStatus
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
+func mergeParts(finalPath string, parts []struct {
+	start, end int64
+	path       string
+}) error {
+	outFile, err := os.Create(finalPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	for _, part := range parts {
+		inFile, err := os.Open(part.path)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(outFile, inFile)
+		inFile.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tryDownload(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, status *DownloadStatus, queue *DownloadQueue) error {
+	fullPath, err := setupDownloadFile(task, queue)
 	if err != nil {
 		return err
 	}
@@ -351,7 +622,7 @@ func tryDownload(task DownloadTask, controlChan chan ControlMessage, results cha
 		resp.Body.Close()
 	}()
 
-	return processDownload(task, file, resp, controlChan, results, status, &fileClosed, fullPath)
+	return processDownload(task, file, resp, controlChan, results, status, &fileClosed, fullPath, queue)
 }
 
 func setupDownloadFile(task DownloadTask, queue *DownloadQueue) (string, error) {
@@ -384,7 +655,7 @@ func initiateDownload(fullPath, url string) (*os.File, *http.Response, error) {
 	return file, resp, nil
 }
 
-func processDownload(task DownloadTask, file *os.File, resp *http.Response, controlChan chan ControlMessage, results chan<- DownloadStatus, status *DownloadStatus, fileClosed *bool, fullPath string) error {
+func processDownload(task DownloadTask, file *os.File, resp *http.Response, controlChan chan ControlMessage, results chan<- DownloadStatus, status *DownloadStatus, fileClosed *bool, fullPath string, queue *DownloadQueue) error {
 	status.TotalBytes = resp.ContentLength
 	status.HasTotalBytes = status.TotalBytes != -1
 	status.BytesInWindow = []int{}
@@ -430,7 +701,7 @@ func processDownload(task DownloadTask, file *os.File, resp *http.Response, cont
 			if status.State != "running" {
 				continue
 			}
-			if err := downloadChunk(task, file, resp.Body, buffer, status, &bytesDownloaded, &accumulatedBytes, &lastUpdate); err != nil {
+			if err := downloadChunk(task, file, resp.Body, buffer, status, &bytesDownloaded, &accumulatedBytes, &lastUpdate, queue); err != nil {
 				if err == io.EOF {
 					updateProgressMap(task.FilePath, *status, 100, bytesDownloaded, status.TotalBytes, status.HasTotalBytes, 0, "0s", "completed")
 					status.State = "completed"
@@ -460,8 +731,8 @@ func safeRemoveFile(filePath string) error {
 	return fmt.Errorf("failed to remove file %s after 5 attempts: file in use", filePath)
 }
 
-func downloadChunk(task DownloadTask, file *os.File, body io.Reader, buffer []byte, status *DownloadStatus, bytesDownloaded, accumulatedBytes *int, lastUpdate *time.Time) error {
-	task.TokenBucket.WaitForTokens(tokenSize)
+func downloadChunk(task DownloadTask, file *os.File, body io.Reader, buffer []byte, status *DownloadStatus, bytesDownloaded, accumulatedBytes *int, lastUpdate *time.Time, queue *DownloadQueue) error {
+	queue.TokenBucket.WaitForTokens(float64(tokenSize))
 	n, err := readAndWriteChunk(body, file, buffer)
 	if err != nil {
 		return err
@@ -488,7 +759,7 @@ func readAndWriteChunk(body io.Reader, file *os.File, buffer []byte) (int, error
 }
 
 func calculateProgress(bytesDownloaded int, totalBytes int64, hasTotalBytes bool) int {
-	if !hasTotalBytes {
+	if !hasTotalBytes || totalBytes <= 0 {
 		return 0
 	}
 	if int64(bytesDownloaded) >= totalBytes {
@@ -498,22 +769,28 @@ func calculateProgress(bytesDownloaded int, totalBytes int64, hasTotalBytes bool
 }
 
 func calculateSpeedAndETA(bytesInWindow []int, timestamps []time.Time, bytesDownloaded int, totalBytes int64, hasTotalBytes bool) (int, string) {
+	if len(timestamps) == 0 {
+		return 0, "N/A"
+	}
+
 	var totalBytesInWindow int
 	for _, b := range bytesInWindow {
 		totalBytesInWindow += b
 	}
+	now := time.Now()
 	var windowSeconds float64
 	if len(timestamps) > 1 {
-		windowSeconds = timestamps[len(timestamps)-1].Sub(timestamps[0]).Seconds()
-	} else if len(timestamps) == 1 {
-		windowSeconds = time.Since(timestamps[0]).Seconds()
+		windowSeconds = now.Sub(timestamps[0]).Seconds()
+	} else {
+		windowSeconds = now.Sub(timestamps[0]).Seconds()
 	}
-	var speed int
-	if windowSeconds > 0 {
-		speed = int(float64(totalBytesInWindow) / windowSeconds / 1024)
+	if windowSeconds <= 0 {
+		windowSeconds = 0.001 // Avoid division by zero
 	}
+
+	speed := int(float64(totalBytesInWindow) / windowSeconds / 1024) // KB/s
 	var eta string
-	if hasTotalBytes && speed > 0 {
+	if hasTotalBytes && speed > 0 && totalBytes > 0 {
 		remainingBytes := totalBytes - int64(bytesDownloaded)
 		if remainingBytes <= 0 {
 			eta = "0s"
@@ -556,6 +833,7 @@ func newDownloadStatus(task DownloadTask, status *DownloadStatus, progress int, 
 		BytesInWindow: status.BytesInWindow,
 		Timestamps:    status.Timestamps,
 		State:         state,
+		PartID:        status.PartID,
 	}
 }
 
@@ -618,6 +896,7 @@ func updateProgressMap(filePath string, status DownloadStatus, progress int, byt
 		BytesInWindow: status.BytesInWindow,
 		Timestamps:    status.Timestamps,
 		State:         state,
+		PartID:        status.PartID,
 	}
 	progressMux.Unlock()
 }
@@ -663,10 +942,17 @@ func displayProgress(wg *sync.WaitGroup) {
 				fmt.Println("Active Downloads:")
 				hasActive := false
 				for filePath, status := range progressMap {
-					if status.State != "pending" {
+					if status.PartID == -1 && status.State != "pending" {
 						hasActive = true
 						fmt.Printf("  %s (ID: %d): %s (%d KB/s) ETA: %s State: %s\n",
 							filePath, status.ID, progressBar(status), status.Speed, status.ETA, status.State)
+						for i := 0; i < numParts; i++ {
+							partKey := fmt.Sprintf("%s.part%d", filePath, i)
+							if partStatus, ok := progressMap[partKey]; ok {
+								fmt.Printf("    Part %d: %s (%d KB/s) ETA: %s State: %s\n",
+									i, progressBar(partStatus), partStatus.Speed, partStatus.ETA, partStatus.State)
+							}
+						}
 					}
 				}
 				if !hasActive {
@@ -676,7 +962,7 @@ func displayProgress(wg *sync.WaitGroup) {
 				fmt.Println("Pending Downloads:")
 				hasPending := false
 				for filePath, status := range progressMap {
-					if status.State == "pending" {
+					if status.PartID == -1 && status.State == "pending" {
 						hasPending = true
 						fmt.Printf("  %s (ID: %d): State: %s\n", filePath, status.ID, status.State)
 					}
@@ -760,87 +1046,28 @@ func setupQueuePool(queue *DownloadQueue) (*WorkerPool, error) {
 	if len(queue.Tasks) == 0 {
 		return nil, fmt.Errorf("queue has no tasks")
 	}
-	initialBandwidth := queue.SpeedLimit / float64(queue.ConcurrentLimit)
+	// Initialize queue-level TokenBucket
+	queue.TokenBucket = NewTokenBucket(queue.SpeedLimit, queue.SpeedLimit)
+	fmt.Printf("Queue %d TokenBucket initialized with max %.1f KB/s\n", queue.ID, queue.SpeedLimit/1024)
 	for i := range queue.Tasks {
 		queue.Tasks[i].QueueID = queue.ID
-		queue.Tasks[i].TokenBucket = NewTokenBucket(initialBandwidth, initialBandwidth)
 	}
 	queues[queue.ID] = queue
-
-	bandwidthChans[queue.ID] = make(chan struct{}, 1)
-	go manageBandwidthRedistribution(queue.ID)
-
-	time.Sleep(100 * time.Millisecond)
-	triggerBandwidthRedistribution(queue.ID)
-
 	return NewWorkerPool(queue.ConcurrentLimit), nil
-}
-
-func triggerBandwidthRedistribution(queueID int) {
-	bandwidthMux.Lock()
-	if ch, exists := bandwidthChans[queueID]; exists {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
-	bandwidthMux.Unlock()
-}
-
-func manageBandwidthRedistribution(queueID int) {
-	for range bandwidthChans[queueID] {
-		if queue, exists := queues[queueID]; exists {
-			redistributeBandwidth(queue)
-		}
-	}
 }
 
 func updateQueueSpeedLimit(queueID int, newSpeedLimit float64) {
 	if queue, exists := queues[queueID]; exists {
 		queue.SpeedLimit = newSpeedLimit
-		fmt.Printf("Updated speed limit for Queue %d to %f KB/s\n", queueID, newSpeedLimit/1024)
-		triggerBandwidthRedistribution(queueID)
+		queue.TokenBucket.mu.Lock()
+		queue.TokenBucket.maxTokens = newSpeedLimit
+		queue.TokenBucket.refillRate = newSpeedLimit
+		queue.TokenBucket.tokens = math.Min(queue.TokenBucket.tokens, newSpeedLimit)
+		queue.TokenBucket.mu.Unlock()
+		fmt.Printf("Updated speed limit for Queue %d to %.1f KB/s\n", queueID, newSpeedLimit/1024)
 	} else {
 		fmt.Printf("Queue %d not found\n", queueID)
 	}
-}
-
-func redistributeBandwidth(queue *DownloadQueue) {
-	var activeCount int
-	activeTasks.Range(func(key, value interface{}) bool {
-		if k, ok := key.(string); ok {
-			parts := strings.Split(k, ":")
-			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
-				activeCount++
-			}
-		}
-		return true
-	})
-
-	if activeCount == 0 {
-		return
-	}
-
-	newBandwidthPerTask := queue.SpeedLimit / float64(activeCount)
-	activeTasks.Range(func(key, value interface{}) bool {
-		if k, ok := key.(string); ok {
-			parts := strings.Split(k, ":")
-			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
-				taskID, _ := strconv.Atoi(parts[1])
-				for _, task := range queue.Tasks {
-					if task.ID == taskID && task.TokenBucket != nil {
-						task.TokenBucket.mu.Lock()
-						task.TokenBucket.maxTokens = newBandwidthPerTask
-						task.TokenBucket.tokens = math.Min(task.TokenBucket.tokens, newBandwidthPerTask)
-						task.TokenBucket.refillRate = newBandwidthPerTask
-						task.TokenBucket.mu.Unlock()
-						fmt.Printf("Task %d updated to %f KB/s (active tasks: %d)\n", taskID, newBandwidthPerTask/1024, activeCount)
-					}
-				}
-			}
-		}
-		return true
-	})
 }
 
 func checkQueueTimeWindow(queue *DownloadQueue) {
@@ -883,7 +1110,7 @@ func controlQueueTasks(queue *DownloadQueue, withinTimeWindow bool) {
 
 func submitQueueTasks(queue *DownloadQueue, queuePool *WorkerPool, results chan<- DownloadStatus) {
 	for _, task := range queue.Tasks {
-		controlChan := make(chan ControlMessage, 10) // Larger buffer for queue commands
+		controlChan := make(chan ControlMessage, 10)
 		controlMux.Lock()
 		controlChans[task.ID] = controlChan
 		controlMux.Unlock()
@@ -907,15 +1134,20 @@ func cleanupTask(task DownloadTask) {
 	if status, ok := progressMap[task.FilePath]; ok && (status.State == "completed" || status.State == "canceled") {
 		delete(progressMap, task.FilePath)
 	}
+	for i := 0; i < numParts; i++ {
+		delete(progressMap, fmt.Sprintf("%s.part%d", task.FilePath, i))
+	}
 	progressMux.Unlock()
 
-	if task.TokenBucket != nil {
-		task.TokenBucket.Stop()
-	}
-
 	activeTasks.Delete(fmt.Sprintf("%d:%d", task.QueueID, task.ID))
-	if queue, exists := queues[task.QueueID]; exists {
-		redistributeBandwidth(queue)
+	fmt.Printf("Cleaned up Task %d in Queue %d\n", task.ID, task.QueueID)
+}
+
+func cleanupTaskParts(task DownloadTask, queue *DownloadQueue) {
+	finalPath := filepath.Join(queue.DownloadLocation, subDirDownloads, task.FileType, task.FilePath)
+	for i := 0; i < numParts; i++ {
+		partPath := fmt.Sprintf("%s.part%d", finalPath, i)
+		os.Remove(partPath)
 	}
 }
 
@@ -974,9 +1206,6 @@ func updateQueueRetries(queueID, retries int) {
 }
 
 func setupDownloadQueues() []*DownloadQueue {
-	now := time.Now()
-	startTime1 := now
-	stopTime1 := now.Add(2 * time.Hour)
 	queuesList := []*DownloadQueue{
 		{
 			Tasks: []DownloadTask{
@@ -986,8 +1215,8 @@ func setupDownloadQueues() []*DownloadQueue {
 			},
 			SpeedLimit:       float64(totalBandwidthLimit),
 			ConcurrentLimit:  2,
-			StartTime:        &startTime1,
-			StopTime:         &stopTime1,
+			StartTime:        nil,
+			StopTime:         nil,
 			MaxRetries:       3,
 			ID:               1,
 			DownloadLocation: "C:/CustomDownloads",
@@ -1141,10 +1370,12 @@ func monitorDownloads(wg *sync.WaitGroup, results chan DownloadStatus, totalTask
 		defer wg.Done()
 		count := 0
 		for result := range results {
-			reportDownloadResult(result)
-			count++
-			if count == totalTasks {
-				close(stopDisplay)
+			if result.PartID == -1 { // Only count whole file completions
+				reportDownloadResult(result)
+				count++
+				if count == totalTasks {
+					close(stopDisplay)
+				}
 			}
 		}
 	}()
@@ -1162,41 +1393,16 @@ func reportDownloadResult(result DownloadStatus) {
 
 func applyHardcodedSpeedChanges() {
 	go func() {
-		time.Sleep(5 * time.Second)
-		updateQueueSpeedLimit(1, 600*1024)
-		fmt.Println("Queue 1 speed limit updated to 600 KB/s after 5 seconds")
-
-		time.Sleep(3 * time.Second)
-		startTime, stopTime, _ := parseTimeInterval("10:00", "12:00")
-		updateQueueTimeInterval(1, startTime, stopTime)
-		fmt.Println("Queue 1 time interval updated to 10:00-12:00 after 6 seconds")
-
-		time.Sleep(3 * time.Second)
-		updateQueueRetries(1, 5)
-		fmt.Println("Queue 1 max retries updated to 5 after 9 seconds")
-
-		time.Sleep(3 * time.Second)
-		updateQueueSpeedLimit(1, 700*1024)
-		fmt.Println("Queue 1 speed limit updated to 700 KB/s after 12 seconds")
-
 		time.Sleep(3 * time.Second)
 		sendQueueControlMessage(1, "resume")
-		fmt.Println("Queue 1 all tasks resumed after 15 seconds")
-
-		time.Sleep(3 * time.Second)
-		sendQueueControlMessage(1, "pause")
-		fmt.Println("Queue 1 all tasks paused after 18 seconds")
-
-		time.Sleep(3 * time.Second)
-		sendQueueControlMessage(1, "resume")
-		fmt.Println("Queue 1 all tasks resumed again after 21 seconds")
+		fmt.Println("Queue 1 all tasks resumed after 18 seconds")
 	}()
 }
 
 func main() {
 	downloadQueues := setupDownloadQueues()
 	results := make(chan DownloadStatus, 10)
-	pool := NewWorkerPool(2)
+	pool := NewWorkerPool(2) // Match ConcurrentLimit
 	var wg sync.WaitGroup
 
 	startProgressDisplay(&wg)
@@ -1236,5 +1442,3 @@ func validateQueue(queue *DownloadQueue) error {
 	}
 	return nil
 }
-
-//TODO FIX
