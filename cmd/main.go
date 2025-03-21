@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type DownloadTask struct {
 	FilePath    string
 	FileType    string
 	TokenBucket *TokenBucket
+	QueueID     int // Add QueueID to identify which queue this task belongs to
 }
 
 // DownloadQueue represents a queue of download tasks with its own limits
@@ -35,6 +37,7 @@ type DownloadQueue struct {
 	StartTime       *time.Time // Start time for downloads (nil means no start restriction)
 	StopTime        *time.Time // Stop time for downloads (nil means no stop restriction)
 	MaxRetries      int        // Maximum number of retries for failed downloads
+	ID              int        // Unique ID for each queue
 }
 
 // DownloadStatus represents the status of a download
@@ -78,7 +81,9 @@ var (
 	progressMux  = sync.Mutex{}
 	controlChans = make(map[int]chan ControlMessage)
 	controlMux   = sync.Mutex{}
-	stopDisplay  = make(chan struct{}) // Signal to stop displayProgress
+	stopDisplay  = make(chan struct{})         // Signal to stop displayProgress
+	activeTasks  = sync.Map{}                  // Map[queueID][taskID]bool to track active downloads
+	queues       = make(map[int]DownloadQueue) // Store queues by ID for O(1) lookup
 )
 
 // TokenBucket represents a token bucket system
@@ -247,7 +252,11 @@ func (p *WorkerPool) stop(wait bool) {
 	<-p.stoppedChan
 }
 
-func downloadFile(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, maxRetries int) {
+func downloadFile(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, maxRetries int, queue DownloadQueue) {
+	// Notify start of download
+	activeTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
+	redistributeBandwidth(queue)
+
 	retriesLeft := maxRetries
 	for retriesLeft >= 0 {
 		status := DownloadStatus{
@@ -258,6 +267,8 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 		}
 		if err := tryDownload(task, controlChan, results, &status); err != nil {
 			if err == io.EOF || status.State == "completed" || status.State == "canceled" {
+				activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+				redistributeBandwidth(queue)
 				return // Success or intentional stop
 			}
 			retriesLeft--
@@ -275,8 +286,12 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 			status.State = "canceled"
 			status.Error = fmt.Errorf("download canceled after %d failed attempts: %v", maxRetries+1, err)
 			results <- status
+			activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+			redistributeBandwidth(queue)
 			return
 		}
+		activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+		redistributeBandwidth(queue)
 		return // Success
 	}
 }
@@ -640,10 +655,13 @@ func setupQueuePool(queue DownloadQueue) (*WorkerPool, error) {
 	if len(queue.Tasks) == 0 {
 		return nil, fmt.Errorf("queue has no tasks")
 	}
-	bandwidthPerDownload := queue.SpeedLimit / float64(len(queue.Tasks))
+	// Initial bandwidth split based on ConcurrentLimit
+	initialBandwidth := queue.SpeedLimit / float64(queue.ConcurrentLimit)
 	for i := range queue.Tasks {
-		queue.Tasks[i].TokenBucket = NewTokenBucket(bandwidthPerDownload, bandwidthPerDownload)
+		queue.Tasks[i].QueueID = queue.ID
+		queue.Tasks[i].TokenBucket = NewTokenBucket(initialBandwidth, initialBandwidth)
 	}
+	queues[queue.ID] = queue // Store queue for later reference
 	return NewWorkerPool(queue.ConcurrentLimit), nil
 }
 
@@ -703,7 +721,7 @@ func submitQueueTasks(queue DownloadQueue, queuePool *WorkerPool, results chan<-
 		controlChans[task.ID] = controlChan
 		controlMux.Unlock()
 		queuePool.Submit(func() {
-			downloadFile(task, controlChan, results, queue.MaxRetries)
+			downloadFile(task, controlChan, results, queue.MaxRetries, queue)
 			cleanupTask(task)
 		})
 	}
@@ -716,7 +734,6 @@ func cleanupTask(task DownloadTask) {
 	controlChan, exists := controlChans[task.ID]
 	if exists {
 		delete(controlChans, task.ID)
-		// Only close the channel if it hasn't been closed already
 		select {
 		case <-controlChan:
 			// Channel is already closed, do nothing
@@ -734,6 +751,50 @@ func cleanupTask(task DownloadTask) {
 	if task.TokenBucket != nil {
 		task.TokenBucket.Stop()
 	}
+
+	// Notify end of download
+	activeTasks.Delete(fmt.Sprintf("%d:%d", task.QueueID, task.ID))
+	if queue, exists := queues[task.QueueID]; exists {
+		redistributeBandwidth(queue)
+	}
+}
+
+func redistributeBandwidth(queue DownloadQueue) {
+	var activeCount int
+	activeTasks.Range(func(key, value interface{}) bool {
+		if k, ok := key.(string); ok {
+			parts := strings.Split(k, ":")
+			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
+				activeCount++
+			}
+		}
+		return true
+	})
+
+	if activeCount == 0 {
+		return // No active tasks, no need to redistribute
+	}
+
+	newBandwidthPerTask := queue.SpeedLimit / float64(activeCount)
+	activeTasks.Range(func(key, value interface{}) bool {
+		if k, ok := key.(string); ok {
+			parts := strings.Split(k, ":")
+			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
+				taskID, _ := strconv.Atoi(parts[1])
+				for _, task := range queue.Tasks {
+					if task.ID == taskID && task.TokenBucket != nil {
+						task.TokenBucket.mu.Lock()
+						task.TokenBucket.maxTokens = newBandwidthPerTask
+						task.TokenBucket.tokens = newBandwidthPerTask // Reset tokens to max
+						task.TokenBucket.refillRate = newBandwidthPerTask
+						task.TokenBucket.mu.Unlock()
+						fmt.Printf("Task %d updated to %f KB/s\n", taskID, newBandwidthPerTask/1024) // Debug output
+					}
+				}
+			}
+		}
+		return true
+	})
 }
 
 // ---- Helper Functions ----
@@ -743,6 +804,7 @@ func updateProgress(status *DownloadStatus, filePath string, bytesDownloaded int
 	updateProgressMap(filePath, *status, progress, bytesDownloaded, totalBytes, hasTotalBytes, speed, eta, status.State)
 }
 
+// ---- Main and Setup Functions ----
 func setupDownloadQueues() []DownloadQueue {
 	now := time.Now()
 	startTime1 := now
@@ -752,25 +814,30 @@ func setupDownloadQueues() []DownloadQueue {
 			Tasks: []DownloadTask{
 				{ID: 1, URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
 				{ID: 2, URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
+				{ID: 3, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"}, // Additional link for testing
+				//{ID: 4, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
+				//{ID: 5, URL: "https://example.com/file3.mp3"},
 			},
-			SpeedLimit:      float64(totalBandwidthLimit) * 0.6,
-			ConcurrentLimit: 1,
+			SpeedLimit:      float64(totalBandwidthLimit), /** 0.6*/ // 300 KB/s
+			ConcurrentLimit: 2,
 			StartTime:       &startTime1,
 			StopTime:        &stopTime1,
-			MaxRetries:      3, // Retry up to 3 times
+			MaxRetries:      3,
+			ID:              1,
 		},
-		{
+		/*{
 			Tasks: []DownloadTask{
-				//{ID: 3, URL: "http://nonexistent.example.com/file.mp3"},
-				{ID: 3, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
-				{ID: 4, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
+				//{ID: 6, URL: "http://nonexistent.example.com/file.mp3"},
+				{ID: 6, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
+				{ID: 7, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
 			},
-			SpeedLimit:      float64(totalBandwidthLimit) * 0.4,
-			ConcurrentLimit: 1,
+			SpeedLimit:      float64(totalBandwidthLimit) * 0.4, // 200 KB/s
+			ConcurrentLimit: 2,
 			StartTime:       nil,
 			StopTime:        nil,
-			MaxRetries:      2, // Retry up to 2 times
-		},
+			MaxRetries:      2,
+			ID:              2,
+		},*/
 	}
 	for i := range queues {
 		setFileNames(queues[i].Tasks)
