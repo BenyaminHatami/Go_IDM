@@ -3,6 +3,7 @@ package queue
 import (
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"GoParallelDownload/internal/download"
@@ -15,20 +16,17 @@ import (
 
 var Queues = make(map[int]*types.DownloadQueue)
 
-// ProcessQueue initializes and starts a queue's downloads in its own worker pool.
-func ProcessQueue(queue *types.DownloadQueue, results chan<- types.DownloadStatus) {
+// ProcessQueue now takes a WaitGroup to track individual tasks
+func ProcessQueue(queue *types.DownloadQueue, results chan<- types.DownloadStatus, taskWg *sync.WaitGroup) {
 	if err := setupQueue(queue); err != nil {
 		fmt.Printf("Failed to setup queue %d: %v\n", queue.ID, err)
 		return
 	}
 	queuePool := workerpool.NewWorkerPool(queue.ConcurrentLimit)
 	startTimeCheck(queue)
-	submitQueueTasks(queue, queuePool, results)
-	// Note: We don't call queuePool.StopWait() here to allow parallel execution;
-	// the pool will stop when all tasks are done or the program exits.
+	submitQueueTasks(queue, queuePool, results, taskWg)
 }
 
-// setupQueue configures the queue with a token bucket and assigns queue IDs to tasks.
 func setupQueue(queue *types.DownloadQueue) error {
 	if len(queue.Tasks) == 0 {
 		return fmt.Errorf("queue has no tasks")
@@ -42,7 +40,6 @@ func setupQueue(queue *types.DownloadQueue) error {
 	return nil
 }
 
-// UpdateQueueSpeedLimit adjusts the speed limit for a running queue.
 func UpdateQueueSpeedLimit(queueID int, newSpeedLimit float64) {
 	if queue, exists := Queues[queueID]; exists {
 		queue.SpeedLimit = newSpeedLimit
@@ -57,7 +54,6 @@ func UpdateQueueSpeedLimit(queueID int, newSpeedLimit float64) {
 	}
 }
 
-// startTimeCheck launches a goroutine to monitor the queue's time window.
 func startTimeCheck(queue *types.DownloadQueue) {
 	if queue.StartTime != nil || queue.StopTime != nil {
 		go func() {
@@ -69,7 +65,6 @@ func startTimeCheck(queue *types.DownloadQueue) {
 	}
 }
 
-// checkQueueTimeWindow pauses or resumes tasks based on the time window.
 func checkQueueTimeWindow(queue *types.DownloadQueue) {
 	now := time.Now()
 	withinTimeWindow := true
@@ -88,7 +83,6 @@ func checkQueueTimeWindow(queue *types.DownloadQueue) {
 	controlQueueTasks(queue, withinTimeWindow)
 }
 
-// controlQueueTasks sends pause/resume commands based on the time window.
 func controlQueueTasks(queue *types.DownloadQueue, withinTimeWindow bool) {
 	for _, task := range queue.Tasks {
 		state.ControlMux.Lock()
@@ -109,21 +103,21 @@ func controlQueueTasks(queue *types.DownloadQueue, withinTimeWindow bool) {
 	}
 }
 
-// submitQueueTasks submits all tasks in the queue to its worker pool.
-func submitQueueTasks(queue *types.DownloadQueue, queuePool *workerpool.WorkerPool, results chan<- types.DownloadStatus) {
+func submitQueueTasks(queue *types.DownloadQueue, queuePool *workerpool.WorkerPool, results chan<- types.DownloadStatus, taskWg *sync.WaitGroup) {
 	for _, task := range queue.Tasks {
 		controlChan := make(chan types.ControlMessage, 10)
 		state.ControlMux.Lock()
 		state.ControlChans[task.ID] = controlChan
 		state.ControlMux.Unlock()
+		taskWg.Add(1) // Increment for each task
 		queuePool.Submit(func() {
+			defer taskWg.Done() // Decrement when task finishes
 			download.DownloadFile(task, controlChan, results, queue)
 			progress.CleanupTask(task)
 		})
 	}
 }
 
-// SendQueueControlMessage sends a control message to all tasks in a queue.
 func SendQueueControlMessage(queueID int, action string) {
 	state.ControlMux.Lock()
 	defer state.ControlMux.Unlock()
@@ -139,7 +133,20 @@ func SendQueueControlMessage(queueID int, action string) {
 	}
 }
 
-// UpdateQueueTimeInterval updates the time window for a queue.
+func ApplyHardcodedSpeedChanges() {
+	time.Sleep(3 * time.Second)
+	SendQueueControlMessage(1, "resume")
+	fmt.Println("Queue 1 all tasks resumed after 3 seconds")
+
+	time.Sleep(5 * time.Second)
+	UpdateQueueSpeedLimit(1, 600*1024)
+	fmt.Println("Queue 1 speed limit updated to 600 KB/s after 8 seconds")
+
+	time.Sleep(5 * time.Second)
+	UpdateQueueSpeedLimit(1, 700*1024)
+	fmt.Println("Queue 1 speed limit updated to 700 KB/s after 13 seconds")
+}
+
 func UpdateQueueTimeInterval(queueID int, startTime, stopTime *time.Time) {
 	if queue, exists := Queues[queueID]; exists {
 		queue.StartTime = startTime
@@ -152,7 +159,6 @@ func UpdateQueueTimeInterval(queueID int, startTime, stopTime *time.Time) {
 	}
 }
 
-// UpdateQueueRetries updates the maximum retries for a queue.
 func UpdateQueueRetries(queueID, retries int) {
 	if retries < 0 {
 		fmt.Println("Retries cannot be negative")
@@ -166,7 +172,6 @@ func UpdateQueueRetries(queueID, retries int) {
 	}
 }
 
-// ValidateQueue checks queue parameters for validity.
 func ValidateQueue(queue *types.DownloadQueue) error {
 	if queue.SpeedLimit <= 0 {
 		return fmt.Errorf("speed limit must be positive")

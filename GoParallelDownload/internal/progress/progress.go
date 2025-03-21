@@ -16,21 +16,26 @@ func StartProgressDisplay(wg *sync.WaitGroup) {
 	go displayProgress(wg)
 }
 
-func MonitorDownloads(wg *sync.WaitGroup, results chan types.DownloadStatus, totalTasks int) {
+func MonitorDownloads(wg *sync.WaitGroup, results <-chan types.DownloadStatus, totalTasks int) {
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		count := 0
-		for result := range results {
-			if result.PartID == -1 {
-				ReportDownloadResult(result)
-				count++
-				if count == totalTasks {
-					close(state.StopDisplay)
-				}
+	defer wg.Done()
+
+	completedTasks := 0
+	for status := range results {
+		// Update progress state as before
+		if status.State == "completed" || status.State == "canceled" || status.State == "failed" {
+			completedTasks++
+			// Log completion
+			if status.State == "completed" {
+				fmt.Printf("Task %d (%s) completed\n", status.ID, status.URL)
 			}
 		}
-	}()
+		// No premature closing of results here; let main.go handle it
+		if completedTasks >= totalTasks {
+			break // Exit loop when all tasks are accounted for, but don’t close channel
+		}
+	}
+	// Do NOT close(results) here; it’s handled in main.go after taskWg.Wait()
 }
 
 func SendControlMessage(taskID, queueID int, action string) {

@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+var taskWg sync.WaitGroup // Global WaitGroup to track individual tasks
+
 func main() {
 	downloadQueues := setupDownloadQueues()
 	results := make(chan types.DownloadStatus, 10)
@@ -22,19 +24,18 @@ func main() {
 		totalTasks += len(q.Tasks)
 		if err := queue.ValidateQueue(q); err != nil {
 			fmt.Printf("Queue %d validation failed: %v\n", q.ID, err)
-			continue // Skip invalid queues but keep running
+			continue
 		}
-		// Launch each queue in a goroutine for parallel execution
-		go queue.ProcessQueue(q, results)
+		go queue.ProcessQueue(q, results, &taskWg)
 	}
 
-	go cli.HandleUserInput(&wg) // Adjusted to not pass pool
+	go cli.HandleUserInput(&wg)
 	applyHardcodedSpeedChanges()
-	progress.MonitorDownloads(&wg, results, totalTasks)
+	go progress.MonitorDownloads(&wg, results, totalTasks) // Run in goroutine to not block
 
-	// No pool.StopWait() needed since each queue has its own pool
-	close(results)
-	wg.Wait()
+	wg.Wait()      // Wait for progress display and CLI to finish
+	taskWg.Wait()  // Wait for all download tasks to complete
+	close(results) // Close results only after all tasks are done
 	fmt.Println("All downloads processed.")
 }
 
