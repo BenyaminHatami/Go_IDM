@@ -135,30 +135,7 @@ func applyHardcodedSpeedChanges() {
 		fmt.Println("Queue 1 all tasks resumed after 2 seconds")
 
 		time.Sleep(5 * time.Second)
-		queue.UpdateQueueSpeedLimit(1, 500*1024)
-		fmt.Println("Queue 1 speed limit updated to 500 KB/s after 7 seconds")
-
-		time.Sleep(5 * time.Second)
-		now := time.Now()
-		startTime := now
-		stopTime := now.Add(3 * time.Minute)
-		queue.UpdateQueueTimeInterval(1, &startTime, &stopTime)
-		fmt.Println("Queue 1 time interval updated to now-now+3min after 12 seconds")
-
-		time.Sleep(5 * time.Second)
-		queue.UpdateQueueRetries(1, 5)
-		fmt.Println("Queue 1 max retries updated to 5 after 17 seconds")
-
-		time.Sleep(5 * time.Second)
-		queue.UpdateQueueSpeedLimit(1, 800*1024)
-		fmt.Println("Queue 1 speed limit updated to 800 KB/s after 22 seconds")
-
-		time.Sleep(5 * time.Second)
 		queue.SendQueueControlMessage(1, "pause")
-		fmt.Println("Queue 1 all tasks paused after 27 seconds")
-
-		time.Sleep(5 * time.Second)
-		queue.SendQueueControlMessage(1, "resume")
 		fmt.Println("Queue 1 all tasks resumed again after 32 seconds")
 	}()
 }

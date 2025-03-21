@@ -121,7 +121,7 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 	finalPath, err := utils.SetupDownloadFile(task, queue)
 	if err != nil {
 		fmt.Printf("Failed to setup download file for %s: %v. Retrying task.\n", task.URL, err)
-		return err // Retry at task level
+		return err
 	}
 
 	partSize := totalSize / int64(types.NumParts)
@@ -143,7 +143,7 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 	partResults := make(chan types.DownloadStatus, types.NumParts)
 	partErrors := make(chan error, types.NumParts)
 	partControlChans := make([]chan types.ControlMessage, types.NumParts)
-	partRetries := make([]int, types.NumParts) // Track retries per part
+	partRetries := make([]int, types.NumParts)
 
 	for i := range parts {
 		partRetries[i] = maxPartRetries
@@ -155,7 +155,7 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 				err := downloadPart(task, partNum, parts[partNum].Start, parts[partNum].End,
 					parts[partNum].Path, partControlChans[partNum], partResults, queue)
 				if err == nil {
-					return // Part succeeded
+					return
 				}
 				partRetries[partNum]--
 				if partRetries[partNum] >= 0 {
@@ -194,7 +194,6 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 	}()
 
 	var totalBytesDone int
-	var totalProgress int
 	partStatuses := make(map[int]types.DownloadStatus)
 	completedParts := 0
 	status.TotalBytes = totalSize
@@ -204,32 +203,52 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 		partStatuses[partStatus.PartID] = partStatus
 		if partStatus.State == "completed" {
 			totalBytesDone += partStatus.BytesDone
-			totalProgress += partStatus.Progress / types.NumParts
 			completedParts++
 		}
 
+		// Calculate total speed as sum of active parts' speeds
 		totalSpeed := 0
 		for i := 0; i < types.NumParts; i++ {
-			if ps, ok := partStatuses[i]; ok {
+			if ps, ok := partStatuses[i]; ok && ps.State == "running" {
 				totalSpeed += ps.Speed
 			}
 		}
 
-		eta := "N/A"
-		if totalSpeed > 0 && status.HasTotalBytes {
-			remainingBytes := totalSize - int64(totalBytesDone)
-			if remainingBytes <= 0 {
-				eta = "0s"
-			} else {
-				etaSeconds := float64(remainingBytes) / float64(totalSpeed*1024)
-				eta = time.Duration(etaSeconds * float64(time.Second)).Truncate(time.Second).String()
+		// Calculate mean progress of all parts
+		totalProgress := 0
+		for i := 0; i < types.NumParts; i++ {
+			if ps, ok := partStatuses[i]; ok {
+				totalProgress += ps.Progress
 			}
 		}
+		meanProgress := totalProgress / types.NumParts
 
-		utils.UpdateProgressMap(task.FilePath, types.DownloadStatus{
+		// Calculate mean ETA of active parts
+		var etaSum time.Duration
+		activeParts := 0
+		for i := 0; i < types.NumParts; i++ {
+			if ps, ok := partStatuses[i]; ok && ps.State == "running" {
+				if ps.ETA != "N/A" && ps.ETA != "0s" {
+					if duration, err := time.ParseDuration(ps.ETA); err == nil {
+						etaSum += duration
+						activeParts++
+					}
+				}
+			}
+		}
+		eta := "N/A"
+		if activeParts > 0 {
+			meanEta := etaSum / time.Duration(activeParts)
+			eta = meanEta.Truncate(time.Second).String()
+		} else if completedParts == types.NumParts {
+			eta = "0s"
+		}
+
+		// Update main task status with mean progress and mean ETA
+		mainStatus := types.DownloadStatus{
 			ID:            task.ID,
 			URL:           task.URL,
-			Progress:      totalProgress,
+			Progress:      meanProgress,
 			BytesDone:     totalBytesDone,
 			TotalBytes:    totalSize,
 			HasTotalBytes: true,
@@ -237,22 +256,24 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 			Speed:         totalSpeed,
 			ETA:           eta,
 			PartID:        -1,
-		}, totalProgress, totalBytesDone, totalSize, true, totalSpeed, eta, "running")
+		}
+		utils.UpdateProgressMap(task.FilePath, mainStatus, meanProgress, totalBytesDone, totalSize, true, totalSpeed, eta, "running")
+		results <- mainStatus
 	}
 
 	if len(partErrors) > 0 {
 		err := <-partErrors
 		fmt.Printf("Multipart download aborted for %s: %v\n", task.URL, err)
-		return err // Trigger task-level retry or cancellation
+		return err
 	}
 
 	if completedParts == types.NumParts {
 		if err := utils.MergeParts(finalPath, parts); err != nil {
 			fmt.Printf("Failed to merge parts for %s: %v. Retrying task.\n", task.URL, err)
 			for _, part := range parts {
-				os.Remove(part.Path) // Clean up parts
+				os.Remove(part.Path)
 			}
-			return err // Retry at task level
+			return err
 		}
 		for _, part := range parts {
 			if err := os.Remove(part.Path); err != nil && !os.IsNotExist(err) {
@@ -262,6 +283,8 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 		status.State = "completed"
 		status.Progress = 100
 		status.BytesDone = int(totalSize)
+		status.Speed = 0
+		status.ETA = "0s"
 		utils.UpdateProgressMap(task.FilePath, *status, 100, int(totalSize), totalSize, true, 0, "0s", "completed")
 		results <- *status
 		return nil
@@ -270,6 +293,7 @@ func downloadMultipart(task types.DownloadTask, controlChan chan types.ControlMe
 	return fmt.Errorf("incomplete download: only %d of %d parts completed", completedParts, types.NumParts)
 }
 
+// No changes needed below this point; included for completeness
 func downloadPart(task types.DownloadTask, partNum int, start, end int64, partPath string, controlChan chan types.ControlMessage, results chan<- types.DownloadStatus, queue *types.DownloadQueue) error {
 	req, err := http.NewRequest("GET", task.URL, nil)
 	if err != nil {
@@ -433,7 +457,7 @@ func tryDownload(task types.DownloadTask, controlChan chan types.ControlMessage,
 
 		err = processDownload(task, file, resp, controlChan, results, status, &fileClosed, fullPath, queue)
 		if err == nil || status.State == "canceled" {
-			return err // Success or canceled
+			return err
 		}
 		networkRetries--
 		if networkRetries > 0 {
