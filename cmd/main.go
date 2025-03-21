@@ -77,13 +77,15 @@ const (
 
 // Global variables for progress tracking
 var (
-	progressMap  = make(map[string]DownloadStatus)
-	progressMux  = sync.Mutex{}
-	controlChans = make(map[int]chan ControlMessage)
-	controlMux   = sync.Mutex{}
-	stopDisplay  = make(chan struct{})         // Signal to stop displayProgress
-	activeTasks  = sync.Map{}                  // Map[queueID][taskID]bool to track active downloads
-	queues       = make(map[int]DownloadQueue) // Store queues by ID for O(1) lookup
+	progressMap    = make(map[string]DownloadStatus)
+	progressMux    = sync.Mutex{}
+	controlChans   = make(map[int]chan ControlMessage)
+	controlMux     = sync.Mutex{}
+	stopDisplay    = make(chan struct{})         // Signal to stop displayProgress
+	activeTasks    = sync.Map{}                  // Map[queueID][taskID]bool to track active downloads
+	queues         = make(map[int]DownloadQueue) // Store queues by ID for O(1) lookup
+	bandwidthChans = make(map[int]chan struct{}) // Channels to trigger bandwidth redistribution per queue
+	bandwidthMux   = sync.Mutex{}
 )
 
 // TokenBucket represents a token bucket system
@@ -257,7 +259,7 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 	for {
 		// Notify start of download
 		activeTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
-		redistributeBandwidth(queue)
+		triggerBandwidthRedistribution(queue.ID)
 
 		status := DownloadStatus{
 			ID:          task.ID,
@@ -274,7 +276,7 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 		if err != nil {
 			if err == io.EOF || status.State == "completed" || status.State == "canceled" {
 				activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-				redistributeBandwidth(queue)
+				triggerBandwidthRedistribution(queue.ID)
 				return // Success or intentional stop
 			}
 			retriesLeft--
@@ -293,11 +295,11 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 			status.Error = fmt.Errorf("download canceled after %d failed attempts: %v", maxRetries+1, err)
 			results <- status
 			activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-			redistributeBandwidth(queue)
+			triggerBandwidthRedistribution(queue.ID)
 			return
 		}
 		activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
-		redistributeBandwidth(queue)
+		triggerBandwidthRedistribution(queue.ID)
 		return // Success
 	}
 }
@@ -711,7 +713,37 @@ func setupQueuePool(queue DownloadQueue) (*WorkerPool, error) {
 		queue.Tasks[i].TokenBucket = NewTokenBucket(initialBandwidth, initialBandwidth)
 	}
 	queues[queue.ID] = queue // Store queue for later reference
+
+	// Start bandwidth redistribution goroutine for this queue
+	bandwidthChans[queue.ID] = make(chan struct{}, 1)
+	go manageBandwidthRedistribution(queue.ID)
+
+	// Trigger initial redistribution after all tasks are set up
+	time.Sleep(100 * time.Millisecond) // Allow tasks to register
+	triggerBandwidthRedistribution(queue.ID)
+
 	return NewWorkerPool(queue.ConcurrentLimit), nil
+}
+
+func triggerBandwidthRedistribution(queueID int) {
+	bandwidthMux.Lock()
+	if ch, exists := bandwidthChans[queueID]; exists {
+		select {
+		case ch <- struct{}{}:
+			// Successfully triggered redistribution
+		default:
+			// Channel already has a pending request
+		}
+	}
+	bandwidthMux.Unlock()
+}
+
+func manageBandwidthRedistribution(queueID int) {
+	for range bandwidthChans[queueID] {
+		if queue, exists := queues[queueID]; exists {
+			redistributeBandwidth(queue)
+		}
+	}
 }
 
 func startTimeCheck(queue DownloadQueue) {
@@ -834,10 +866,10 @@ func redistributeBandwidth(queue DownloadQueue) {
 					if task.ID == taskID && task.TokenBucket != nil {
 						task.TokenBucket.mu.Lock()
 						task.TokenBucket.maxTokens = newBandwidthPerTask
-						task.TokenBucket.tokens = newBandwidthPerTask // Reset tokens to max
+						task.TokenBucket.tokens = math.Min(task.TokenBucket.tokens, newBandwidthPerTask) // Avoid overfilling
 						task.TokenBucket.refillRate = newBandwidthPerTask
 						task.TokenBucket.mu.Unlock()
-						fmt.Printf("Task %d updated to %f KB/s\n", taskID, newBandwidthPerTask/1024) // Debug output
+						fmt.Printf("Task %d updated to %f KB/s (active tasks: %d)\n", taskID, newBandwidthPerTask/1024, activeCount) // Debug output
 					}
 				}
 			}
