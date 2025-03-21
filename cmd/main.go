@@ -175,7 +175,7 @@ type WorkerPool struct {
 	wait         bool
 }
 
-// New creates a new Worker Pool
+// NewWorkerPool New creates a new Worker Pool
 func NewWorkerPool(maxWorkers int) *WorkerPool {
 	if maxWorkers < 1 {
 		maxWorkers = 1
@@ -696,6 +696,17 @@ func setFileType(tasks []DownloadTask) {
 	}
 }
 
+func startTimeCheck(queue DownloadQueue) {
+	if queue.StartTime != nil || queue.StopTime != nil {
+		go func() {
+			for {
+				checkQueueTimeWindow(queue)
+				time.Sleep(10 * time.Second)
+			}
+		}()
+	}
+}
+
 // processQueue updated to handle nil StartTime/StopTime
 func processQueue(queue DownloadQueue, pool *WorkerPool, results chan<- DownloadStatus) {
 	queuePool, err := setupQueuePool(queue)
@@ -752,6 +763,17 @@ func manageBandwidthRedistribution(queueID int) {
 	}
 }
 
+func updateQueueSpeedLimit(queueID int, newSpeedLimit float64) {
+	if queue, exists := queues[queueID]; exists {
+		queue.SpeedLimit = newSpeedLimit
+		queues[queueID] = queue // Update the global queues map
+		fmt.Printf("Updated speed limit for Queue %d to %f KB/s\n", queueID, newSpeedLimit/1024)
+		triggerBandwidthRedistribution(queueID)
+	} else {
+		fmt.Printf("Queue %d not found\n", queueID)
+	}
+}
+
 func redistributeBandwidth(queue DownloadQueue) {
 	var activeCount int
 	activeTasks.Range(func(key, value interface{}) bool {
@@ -790,29 +812,21 @@ func redistributeBandwidth(queue DownloadQueue) {
 	})
 }
 
-func startTimeCheck(queue DownloadQueue) {
-	if queue.StartTime != nil || queue.StopTime != nil {
-		go func() {
-			for {
-				checkQueueTimeWindow(queue)
-				time.Sleep(10 * time.Second)
-			}
-		}()
-	}
-}
-
 func checkQueueTimeWindow(queue DownloadQueue) {
 	now := time.Now()
 	withinTimeWindow := true
 	if queue.StartTime != nil {
-		startToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StartTime.Hour(), queue.StartTime.Minute(), 0, 0, time.Local)
+		startToday := time.Date(queue.StartTime.Year(), queue.StartTime.Month(), queue.StartTime.Day(), queue.StartTime.Hour(), queue.StartTime.Minute(), 0, 0, time.Local)
+
 		if now.Before(startToday) {
+			fmt.Printf("enterd for start")
 			withinTimeWindow = false
 		}
 	}
 	if queue.StopTime != nil {
-		stopToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StopTime.Hour(), queue.StopTime.Minute(), 0, 0, time.Local)
+		stopToday := time.Date(queue.StopTime.Year(), queue.StopTime.Month(), queue.StopTime.Day(), queue.StopTime.Hour(), queue.StopTime.Minute(), 0, 0, time.Local)
 		if now.After(stopToday) {
+			fmt.Printf("enterd for stop")
 			withinTimeWindow = false
 		}
 	}
@@ -961,8 +975,33 @@ func processCommand(input string, pool *WorkerPool) bool {
 		return false
 	}
 	parts := strings.Split(input, " ")
+	if len(parts) < 2 {
+		fmt.Println("Invalid command. Use 'pause ID', 'resume ID', 'cancel ID', 'reset ID', or 'speed QUEUE_ID KB_PER_SEC' (e.g., 'pause 1' or 'speed 1 600')")
+		return true
+	}
+
+	action := parts[0]
+	if action == "speed" {
+		if len(parts) != 3 {
+			fmt.Println("Invalid speed command. Use 'speed QUEUE_ID KB_PER_SEC' (e.g., 'speed 1 600')")
+			return true
+		}
+		var queueID int
+		if _, err := fmt.Sscanf(parts[1], "%d", &queueID); err != nil {
+			fmt.Println("Invalid queue ID. Must be a number.")
+			return true
+		}
+		var speedKB int
+		if _, err := fmt.Sscanf(parts[2], "%d", &speedKB); err != nil {
+			fmt.Println("Invalid speed. Must be a number (KB/s).")
+			return true
+		}
+		updateQueueSpeedLimit(queueID, float64(speedKB*1024))
+		return true
+	}
+
 	if len(parts) != 2 {
-		fmt.Println("Invalid command. Use 'pause ID', 'resume ID', 'cancel ID', or 'reset ID' (e.g., 'pause 1')")
+		fmt.Println("Invalid command. Use 'pause ID', 'resume ID', 'cancel ID', 'reset ID', or 'speed QUEUE_ID KB_PER_SEC' (e.g., 'pause 1' or 'speed 1 600')")
 		return true
 	}
 	var taskID int
@@ -970,9 +1009,8 @@ func processCommand(input string, pool *WorkerPool) bool {
 		fmt.Println("Invalid task ID. Must be a number.")
 		return true
 	}
-	action := parts[0]
 	if action != "pause" && action != "resume" && action != "cancel" && action != "reset" {
-		fmt.Println("Invalid action. Use 'pause', 'resume', 'cancel', or 'reset'.")
+		fmt.Println("Invalid action. Use 'pause', 'resume', 'cancel', 'reset', or 'speed'.")
 		return true
 	}
 	sendControlMessage(taskID, action)
@@ -1015,6 +1053,20 @@ func reportDownloadResult(result DownloadStatus) {
 	}
 }
 
+// New function for hardcoded speed changes
+func applyHardcodedSpeedChanges() {
+	// Hardcode speed changes for Queue 1
+	go func() {
+		time.Sleep(3 * time.Second)
+		updateQueueSpeedLimit(1, 600*1024)
+		fmt.Println("Queue 1 speed limit updated to 600 KB/s after 3 seconds")
+
+		time.Sleep(3 * time.Second) // Total 6 seconds
+		updateQueueSpeedLimit(1, 700*1024)
+		fmt.Println("Queue 1 speed limit updated to 700 KB/s after 6 seconds")
+	}()
+}
+
 func main() {
 	downloadQueues := setupDownloadQueues()
 	results := make(chan DownloadStatus, 10)
@@ -1036,6 +1088,8 @@ func main() {
 	for _, q := range downloadQueues {
 		totalTasks += len(q.Tasks)
 	}
+
+	applyHardcodedSpeedChanges()
 	monitorDownloads(&wg, results, totalTasks)
 
 	pool.StopWait()
