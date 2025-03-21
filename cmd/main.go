@@ -31,13 +31,14 @@ type DownloadTask struct {
 
 // DownloadQueue represents a queue of download tasks with its own limits
 type DownloadQueue struct {
-	Tasks           []DownloadTask
-	SpeedLimit      float64    // Bandwidth limit in bytes/sec
-	ConcurrentLimit int        // Max simultaneous downloads
-	StartTime       *time.Time // Start time for downloads (nil means no start restriction)
-	StopTime        *time.Time // Stop time for downloads (nil means no stop restriction)
-	MaxRetries      int        // Maximum number of retries for failed downloads
-	ID              int        // Unique ID for each queue
+	Tasks            []DownloadTask
+	SpeedLimit       float64    // Bandwidth limit in bytes/sec
+	ConcurrentLimit  int        // Max simultaneous downloads
+	StartTime        *time.Time // Start time for downloads (nil means no start restriction)
+	StopTime         *time.Time // Stop time for downloads (nil means no stop restriction)
+	MaxRetries       int        // Maximum number of retries for failed downloads
+	ID               int        // Unique ID for each queue
+	DownloadLocation string     // Custom download location for this queue
 }
 
 // DownloadStatus represents the status of a download
@@ -65,9 +66,10 @@ type ControlMessage struct {
 
 // Constants
 const (
-	totalBandwidthLimit = 500 * 1024             // 500 KB/s total available bandwidth
-	tokenSize           = 1024                   // 1 KB per token
-	downloadDir         = "Downloads/"           // Folder to save files
+	totalBandwidthLimit = 500 * 1024   // 500 KB/s total available bandwidth
+	tokenSize           = 1024         // 1 KB per token
+	subDirDownloads     = "Downloads/" // Subdirectory name
+
 	windowDuration      = 1 * time.Second        // Rolling window for speed calculation
 	updateIntervalBytes = 10 * 1024              // Update progressMap every 10 KB
 	updateIntervalTime  = 100 * time.Millisecond // Update progressMap every 100ms
@@ -305,7 +307,7 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 }
 
 func tryDownload(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, status *DownloadStatus) error {
-	fullPath, err := setupDownloadFile(task)
+	fullPath, err := setupDownloadFile(task, queues[task.QueueID])
 	if err != nil {
 		return err
 	}
@@ -328,12 +330,16 @@ func tryDownload(task DownloadTask, controlChan chan ControlMessage, results cha
 	return processDownload(task, file, resp, controlChan, results, status, &fileClosed, fullPath)
 }
 
-func setupDownloadFile(task DownloadTask) (string, error) {
-	dir := downloadDir + task.FileType
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create directory %s: %v", dir, err)
+func setupDownloadFile(task DownloadTask, queue DownloadQueue) (string, error) {
+	baseDir := queue.DownloadLocation
+	if baseDir == "" {
+		baseDir = "." // Default to current directory if not specified
 	}
-	return filepath.Join(dir, task.FilePath), nil
+	fullDir := filepath.Join(baseDir, subDirDownloads, task.FileType)
+	if err := os.MkdirAll(fullDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create directory %s: %v", fullDir, err)
+	}
+	return filepath.Join(fullDir, task.FilePath), nil
 }
 
 func initiateDownload(fullPath, url string) (*os.File, *http.Response, error) {
@@ -416,7 +422,7 @@ func processDownload(task DownloadTask, file *os.File, resp *http.Response, cont
 }
 
 func safeRemoveFile(filePath string) error {
-	//TODO 5 and 500 miliseconds
+	//TODO max file remove retries 5
 	for i := 0; i < 5; i++ {
 		err := os.Remove(filePath)
 		if err == nil {
@@ -425,12 +431,12 @@ func safeRemoveFile(filePath string) error {
 		// Check if the error is due to the file being in use
 		if strings.Contains(err.Error(), "being used by another process") {
 			fmt.Printf("File %s in use, retrying removal (%d/%d)...\n", filePath, i+1, 5)
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(time.Millisecond * 500)
 			continue
 		}
 		return fmt.Errorf("failed to remove file %s: %v", filePath, err)
 	}
-	return fmt.Errorf("failed to remove file %s after %d attempts: file in use", filePath, 500*time.Millisecond)
+	return fmt.Errorf("failed to remove file %s after %d attempts: file in use", filePath, time.Millisecond*500)
 }
 
 func downloadChunk(task DownloadTask, file *os.File, body io.Reader, buffer []byte, status *DownloadStatus, bytesDownloaded, accumulatedBytes *int, lastUpdate *time.Time) error {
@@ -746,6 +752,44 @@ func manageBandwidthRedistribution(queueID int) {
 	}
 }
 
+func redistributeBandwidth(queue DownloadQueue) {
+	var activeCount int
+	activeTasks.Range(func(key, value interface{}) bool {
+		if k, ok := key.(string); ok {
+			parts := strings.Split(k, ":")
+			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
+				activeCount++
+			}
+		}
+		return true
+	})
+
+	if activeCount == 0 {
+		return // No active tasks, no need to redistribute
+	}
+
+	newBandwidthPerTask := queue.SpeedLimit / float64(activeCount)
+	activeTasks.Range(func(key, value interface{}) bool {
+		if k, ok := key.(string); ok {
+			parts := strings.Split(k, ":")
+			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
+				taskID, _ := strconv.Atoi(parts[1])
+				for _, task := range queue.Tasks {
+					if task.ID == taskID && task.TokenBucket != nil {
+						task.TokenBucket.mu.Lock()
+						task.TokenBucket.maxTokens = newBandwidthPerTask
+						task.TokenBucket.tokens = math.Min(task.TokenBucket.tokens, newBandwidthPerTask) // Avoid overfilling
+						task.TokenBucket.refillRate = newBandwidthPerTask
+						task.TokenBucket.mu.Unlock()
+						fmt.Printf("Task %d updated to %f KB/s (active tasks: %d)\n", taskID, newBandwidthPerTask/1024, activeCount) // Debug output
+					}
+				}
+			}
+		}
+		return true
+	})
+}
+
 func startTimeCheck(queue DownloadQueue) {
 	if queue.StartTime != nil || queue.StopTime != nil {
 		go func() {
@@ -840,44 +884,6 @@ func cleanupTask(task DownloadTask) {
 	}
 }
 
-func redistributeBandwidth(queue DownloadQueue) {
-	var activeCount int
-	activeTasks.Range(func(key, value interface{}) bool {
-		if k, ok := key.(string); ok {
-			parts := strings.Split(k, ":")
-			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
-				activeCount++
-			}
-		}
-		return true
-	})
-
-	if activeCount == 0 {
-		return // No active tasks, no need to redistribute
-	}
-
-	newBandwidthPerTask := queue.SpeedLimit / float64(activeCount)
-	activeTasks.Range(func(key, value interface{}) bool {
-		if k, ok := key.(string); ok {
-			parts := strings.Split(k, ":")
-			if len(parts) == 2 && parts[0] == fmt.Sprint(queue.ID) {
-				taskID, _ := strconv.Atoi(parts[1])
-				for _, task := range queue.Tasks {
-					if task.ID == taskID && task.TokenBucket != nil {
-						task.TokenBucket.mu.Lock()
-						task.TokenBucket.maxTokens = newBandwidthPerTask
-						task.TokenBucket.tokens = math.Min(task.TokenBucket.tokens, newBandwidthPerTask) // Avoid overfilling
-						task.TokenBucket.refillRate = newBandwidthPerTask
-						task.TokenBucket.mu.Unlock()
-						fmt.Printf("Task %d updated to %f KB/s (active tasks: %d)\n", taskID, newBandwidthPerTask/1024, activeCount) // Debug output
-					}
-				}
-			}
-		}
-		return true
-	})
-}
-
 // ---- Helper Functions ----
 func updateProgress(status *DownloadStatus, filePath string, bytesDownloaded int, totalBytes int64, hasTotalBytes bool) {
 	progress := calculateProgress(bytesDownloaded, totalBytes, hasTotalBytes)
@@ -899,25 +905,26 @@ func setupDownloadQueues() []DownloadQueue {
 				//{ID: 4, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
 				//{ID: 5, URL: "https://example.com/file3.mp3"},
 			},
-			SpeedLimit:      float64(totalBandwidthLimit), /** 0.6*/ // 300 KB/s
-			ConcurrentLimit: 2,
-			StartTime:       &startTime1,
-			StopTime:        &stopTime1,
-			MaxRetries:      3,
-			ID:              1,
+			SpeedLimit:       float64(totalBandwidthLimit), // 500 KB/s
+			ConcurrentLimit:  2,
+			StartTime:        &startTime1,
+			StopTime:         &stopTime1,
+			MaxRetries:       3,
+			ID:               1,
+			DownloadLocation: "C:/CustomDownloads", // Example custom location
 		},
 		/*{
-			Tasks: []DownloadTask{
-				//{ID: 6, URL: "http://nonexistent.example.com/file.mp3"},
-				{ID: 6, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
-				{ID: 7, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
-			},
-			SpeedLimit:      float64(totalBandwidthLimit) * 0.4, // 200 KB/s
-			ConcurrentLimit: 2,
-			StartTime:       nil,
-			StopTime:        nil,
-			MaxRetries:      2,
-			ID:              2,
+		    Tasks: []DownloadTask{
+		        {ID: 6, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
+		        {ID: 7, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
+		    },
+		    SpeedLimit:      float64(totalBandwidthLimit) * 0.4, // 200 KB/s
+		    ConcurrentLimit: 2,
+		    StartTime:       nil,
+		    StopTime:        nil,
+		    MaxRetries:      2,
+		    ID:              2,
+		    DownloadLocation: "D:/AnotherLocation", // Another example custom location
 		},*/
 	}
 	for i := range queues {
