@@ -1,10 +1,6 @@
 package cli
 
 import (
-	"GoParallelDownload/internal/progress"
-	"GoParallelDownload/internal/queue"
-	"GoParallelDownload/internal/state"
-	"GoParallelDownload/pkg/concurrency/workerpool"
 	"bufio"
 	"fmt"
 	"os"
@@ -12,27 +8,39 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"GoParallelDownload/internal/progress"
+	"GoParallelDownload/internal/queue"
+	"GoParallelDownload/internal/state"
 )
 
-func HandleUserInput(wg *sync.WaitGroup, pool *workerpool.WorkerPool) {
+func HandleUserInput(wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
-			if !processCommand(scanner.Text(), pool) {
+			if !processCommand(scanner.Text()) {
 				return
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("Scanner error: %v\n", err)
 		}
 	}()
 }
 
-func processCommand(input string, pool *workerpool.WorkerPool) bool {
+func processCommand(input string) bool {
 	input = strings.TrimSpace(input)
 	if input == "exit" {
 		fmt.Println("Exiting...")
-		pool.StopWait()
-		close(state.StopDisplay)
+		// Cancel all active queues
+		state.ControlMux.Lock()
+		for queueID := range queue.Queues {
+			queue.SendQueueControlMessage(queueID, "cancel")
+		}
+		state.ControlMux.Unlock()
+		close(state.StopDisplay) // Stop progress display
 		return false
 	}
 	parts := strings.Split(input, " ")

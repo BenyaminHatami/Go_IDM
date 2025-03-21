@@ -4,7 +4,6 @@ import (
 	"GoParallelDownload/internal/cli"
 	"GoParallelDownload/internal/progress"
 	"GoParallelDownload/internal/queue"
-	"GoParallelDownload/pkg/concurrency/workerpool"
 	"GoParallelDownload/pkg/types"
 	"fmt"
 	"sync"
@@ -14,29 +13,26 @@ import (
 func main() {
 	downloadQueues := setupDownloadQueues()
 	results := make(chan types.DownloadStatus, 10)
-	pool := workerpool.NewWorkerPool(2)
 	var wg sync.WaitGroup
 
 	progress.StartProgressDisplay(&wg)
-	for _, q := range downloadQueues {
-		pool.Submit(func() {
-			queue.ProcessQueue(q, pool, results)
-		})
-		if err := queue.ValidateQueue(q); err != nil {
-			fmt.Printf("Queue %d validation failed: %v\n", q.ID, err)
-		}
-	}
-	cli.HandleUserInput(&wg, pool)
 
 	totalTasks := 0
 	for _, q := range downloadQueues {
 		totalTasks += len(q.Tasks)
+		if err := queue.ValidateQueue(q); err != nil {
+			fmt.Printf("Queue %d validation failed: %v\n", q.ID, err)
+			continue // Skip invalid queues but keep running
+		}
+		// Launch each queue in a goroutine for parallel execution
+		go queue.ProcessQueue(q, results)
 	}
 
+	go cli.HandleUserInput(&wg) // Adjusted to not pass pool
 	applyHardcodedSpeedChanges()
 	progress.MonitorDownloads(&wg, results, totalTasks)
 
-	pool.StopWait()
+	// No pool.StopWait() needed since each queue has its own pool
 	close(results)
 	wg.Wait()
 	fmt.Println("All downloads processed.")
