@@ -24,7 +24,7 @@ type DownloadTask struct {
 	FilePath    string
 	FileType    string
 	TokenBucket *TokenBucket
-	QueueID     int // Add QueueID to identify which queue this task belongs to
+	QueueID     int
 }
 
 // DownloadQueue represents a queue of download tasks with its own limits
@@ -47,19 +47,20 @@ type DownloadStatus struct {
 	BytesDone     int
 	TotalBytes    int64
 	HasTotalBytes bool
-	State         string
+	State         string // "pending", "running", "paused", "completed", "canceled", "failed"
 	Speed         int
 	ETA           string
 	BytesInWindow []int
 	Timestamps    []time.Time
 	Error         error
-	RetriesLeft   int // Track remaining retries
+	RetriesLeft   int
 }
 
 // ControlMessage represents a control command
 type ControlMessage struct {
-	TaskID int
-	Action string // "pause", "resume", "cancel", "reset"
+	TaskID  int
+	QueueID int // Optional: -1 means task-specific, otherwise queue-specific
+	Action  string
 }
 
 // Constants
@@ -81,24 +82,23 @@ var (
 	progressMux    = sync.Mutex{}
 	controlChans   = make(map[int]chan ControlMessage)
 	controlMux     = sync.Mutex{}
-	stopDisplay    = make(chan struct{})          // Signal to stop displayProgress
-	activeTasks    = sync.Map{}                   // Map[queueID:taskID]bool to track active downloads
-	queues         = make(map[int]*DownloadQueue) // Store queue pointers by ID
-	bandwidthChans = make(map[int]chan struct{})  // Channels to trigger bandwidth redistribution per queue
+	stopDisplay    = make(chan struct{})
+	activeTasks    = sync.Map{}                   // Map[queueID:taskID]bool
+	queues         = make(map[int]*DownloadQueue) // Store queue pointers
+	bandwidthChans = make(map[int]chan struct{})
 	bandwidthMux   = sync.Mutex{}
 )
 
 // TokenBucket represents a token bucket system
 type TokenBucket struct {
 	mu             sync.Mutex
-	tokens         float64 // Current number of tokens
-	maxTokens      float64 // Maximum tokens (capacity)
-	refillRate     float64 // Tokens added per second (bytes/sec)
+	tokens         float64
+	maxTokens      float64
+	refillRate     float64
 	lastRefillTime time.Time
-	quit           chan struct{} // To stop the refill goroutine
+	quit           chan struct{}
 }
 
-// NewTokenBucket creates a new TokenBucket instance and starts the refill goroutine
 func NewTokenBucket(maxTokens float64, refillRate float64) *TokenBucket {
 	tb := &TokenBucket{
 		tokens:         maxTokens,
@@ -111,7 +111,6 @@ func NewTokenBucket(maxTokens float64, refillRate float64) *TokenBucket {
 	return tb
 }
 
-// startRefill runs a goroutine to periodically refill the token bucket
 func (tb *TokenBucket) startRefill() {
 	ticker := time.NewTicker(refillInterval)
 	defer ticker.Stop()
@@ -131,12 +130,10 @@ func (tb *TokenBucket) startRefill() {
 	}
 }
 
-// Stop stops the refill goroutine
 func (tb *TokenBucket) Stop() {
 	close(tb.quit)
 }
 
-// Request checks if enough tokens are available and deducts them if so
 func (tb *TokenBucket) Request(tokens float64) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -147,7 +144,6 @@ func (tb *TokenBucket) Request(tokens float64) bool {
 	return false
 }
 
-// WaitForTokens waits until enough tokens are available
 func (tb *TokenBucket) WaitForTokens(tokens float64) {
 	for !tb.Request(tokens) {
 		tb.mu.Lock()
@@ -159,7 +155,7 @@ func (tb *TokenBucket) WaitForTokens(tokens float64) {
 	}
 }
 
-// WorkerPool is a simplified version of the workerpool package
+// WorkerPool implementation (unchanged)
 type WorkerPool struct {
 	maxWorkers   int
 	taskQueue    chan func()
@@ -173,7 +169,6 @@ type WorkerPool struct {
 	wait         bool
 }
 
-// New creates a new Worker Pool
 func NewWorkerPool(maxWorkers int) *WorkerPool {
 	if maxWorkers < 1 {
 		maxWorkers = 1
@@ -189,19 +184,16 @@ func NewWorkerPool(maxWorkers int) *WorkerPool {
 	return pool
 }
 
-// Submit enqueues a function for a worker to execute
 func (p *WorkerPool) Submit(task func()) {
 	if task != nil {
 		p.taskQueue <- task
 	}
 }
 
-// StopWait stops the worker pool and waits for all queued tasks to complete
 func (p *WorkerPool) StopWait() {
 	p.stop(true)
 }
 
-// dispatch sends tasks to workers
 func (p *WorkerPool) dispatch() {
 	defer close(p.stoppedChan)
 	var workerCount int
@@ -232,7 +224,6 @@ func (p *WorkerPool) dispatch() {
 	wg.Wait()
 }
 
-// worker executes tasks
 func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
 	for task != nil {
 		task()
@@ -241,7 +232,6 @@ func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
 	wg.Done()
 }
 
-// stop handles pool shutdown
 func (p *WorkerPool) stop(wait bool) {
 	p.stopOnce.Do(func() {
 		close(p.stopSignal)
@@ -254,20 +244,58 @@ func (p *WorkerPool) stop(wait bool) {
 	<-p.stoppedChan
 }
 
-func downloadFile(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, maxRetries int, queue *DownloadQueue) {
-	// Use queue.MaxRetries directly to ensure it reflects the latest value
+func downloadFile(task DownloadTask, controlChan chan ControlMessage, results chan<- DownloadStatus, queue *DownloadQueue) {
 	retriesLeft := queue.MaxRetries
+	// Start in pending state
+	status := DownloadStatus{
+		ID:          task.ID,
+		URL:         task.URL,
+		State:       "pending",
+		RetriesLeft: retriesLeft,
+	}
+	updateProgressMap(task.FilePath, status, 0, 0, 0, false, 0, "N/A", "pending")
+
 	for {
-		// Notify start of download
+		// Wait for "resume" to start or handle queue-level commands
+		msg := <-controlChan
+		if msg.TaskID == task.ID || msg.QueueID == task.QueueID {
+			switch msg.Action {
+			case "resume":
+				if status.State == "pending" || status.State == "paused" {
+					status.State = "running"
+					updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "running")
+					break
+				}
+				continue
+			case "pause":
+				if status.State == "running" {
+					status.State = "paused"
+					updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "paused")
+				}
+				continue
+			case "cancel":
+				status.State = "canceled"
+				updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, 0, "N/A", "canceled")
+				results <- status
+				activeTasks.Delete(fmt.Sprintf("%d:%d", queue.ID, task.ID))
+				triggerBandwidthRedistribution(queue.ID)
+				return
+			case "reset":
+				if status.State != "pending" {
+					status.State = "pending"
+					updateProgressMap(task.FilePath, status, 0, 0, 0, false, 0, "N/A", "pending")
+				}
+				continue
+			}
+		}
+
+		if status.State != "running" {
+			continue
+		}
+
 		activeTasks.Store(fmt.Sprintf("%d:%d", queue.ID, task.ID), true)
 		triggerBandwidthRedistribution(queue.ID)
 
-		status := DownloadStatus{
-			ID:          task.ID,
-			URL:         task.URL,
-			State:       "running",
-			RetriesLeft: retriesLeft,
-		}
 		err := tryDownload(task, controlChan, results, &status)
 		if err != nil && status.State == "reset" {
 			fmt.Printf("Resetting download for task %d\n", task.ID)
@@ -282,7 +310,7 @@ func downloadFile(task DownloadTask, controlChan chan ControlMessage, results ch
 			retriesLeft--
 			status.Error = err
 			status.State = "failed"
-			updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, status.State)
+			updateProgressMap(task.FilePath, status, status.Progress, status.BytesDone, status.TotalBytes, status.HasTotalBytes, status.Speed, status.ETA, "failed")
 			if retriesLeft >= 0 {
 				fmt.Printf("Download failed for %s: %v. Retries left: %d. Retrying in %v...\n", task.URL, err, retriesLeft, retryDelay)
 				time.Sleep(retryDelay)
@@ -370,7 +398,7 @@ func processDownload(task DownloadTask, file *os.File, resp *http.Response, cont
 	for {
 		select {
 		case msg := <-controlChan:
-			if msg.TaskID == task.ID {
+			if msg.TaskID == task.ID || msg.QueueID == task.QueueID {
 				if msg.Action == "reset" {
 					*fileClosed = true
 					if err := file.Close(); err != nil {
@@ -449,7 +477,6 @@ func downloadChunk(task DownloadTask, file *os.File, body io.Reader, buffer []by
 	return nil
 }
 
-// Helper functions
 func readAndWriteChunk(body io.Reader, file *os.File, buffer []byte) (int, error) {
 	n, err := body.Read(buffer)
 	if n > 0 {
@@ -543,7 +570,7 @@ func handleControlMessage(status *DownloadStatus, task DownloadTask, file *os.Fi
 		progressMux.Unlock()
 		for {
 			resumeMsg := <-controlChan
-			if resumeMsg.TaskID == task.ID {
+			if resumeMsg.TaskID == task.ID || resumeMsg.QueueID == task.QueueID {
 				if resumeMsg.Action == "resume" {
 					progressMux.Lock()
 					progressMap[task.FilePath] = newDownloadStatus(task, status, progress, bytesDownloaded, totalBytes, hasTotalBytes, speed, eta, "running")
@@ -631,15 +658,35 @@ func displayProgress(wg *sync.WaitGroup) {
 		case <-ticker.C:
 			progressMux.Lock()
 			if len(progressMap) == 0 {
-				fmt.Println("No active downloads.")
+				fmt.Println("No downloads.")
 			} else {
+				fmt.Println("Active Downloads:")
+				hasActive := false
 				for filePath, status := range progressMap {
-					fmt.Printf("Downloading %s (ID: %d): %s (%d KB/s) ETA: %s State: %s\n",
-						filePath, status.ID, progressBar(status), status.Speed, status.ETA, status.State)
+					if status.State != "pending" {
+						hasActive = true
+						fmt.Printf("  %s (ID: %d): %s (%d KB/s) ETA: %s State: %s\n",
+							filePath, status.ID, progressBar(status), status.Speed, status.ETA, status.State)
+					}
+				}
+				if !hasActive {
+					fmt.Println("  None")
+				}
+
+				fmt.Println("Pending Downloads:")
+				hasPending := false
+				for filePath, status := range progressMap {
+					if status.State == "pending" {
+						hasPending = true
+						fmt.Printf("  %s (ID: %d): State: %s\n", filePath, status.ID, status.State)
+					}
+				}
+				if !hasPending {
+					fmt.Println("  None")
 				}
 			}
 			progressMux.Unlock()
-			fmt.Println("\nEnter command (e.g., 'pause 1', 'resume 1', 'cancel 1', 'settime 1 10:00 12:00', 'setretries 1 5', or 'exit'):")
+			fmt.Println("\nEnter command (e.g., 'pausequeue 1', 'resumequeue 1', 'cancelqueue 1', 'speed 1 600', 'settime 1 10:00 12:00', 'setretries 1 5', or 'exit'):")
 		}
 	}
 }
@@ -692,7 +739,7 @@ func startTimeCheck(queue *DownloadQueue) {
 		go func() {
 			for {
 				checkQueueTimeWindow(queue)
-				time.Sleep(1 * time.Second) //TODO!!
+				time.Sleep(10 * time.Second)
 			}
 		}()
 	}
@@ -718,7 +765,7 @@ func setupQueuePool(queue *DownloadQueue) (*WorkerPool, error) {
 		queue.Tasks[i].QueueID = queue.ID
 		queue.Tasks[i].TokenBucket = NewTokenBucket(initialBandwidth, initialBandwidth)
 	}
-	queues[queue.ID] = queue // Store the pointer
+	queues[queue.ID] = queue
 
 	bandwidthChans[queue.ID] = make(chan struct{}, 1)
 	go manageBandwidthRedistribution(queue.ID)
@@ -799,16 +846,14 @@ func redistributeBandwidth(queue *DownloadQueue) {
 func checkQueueTimeWindow(queue *DownloadQueue) {
 	now := time.Now()
 	withinTimeWindow := true
-	time1 := queue.StartTime
-	time2 := queue.StopTime
 	if queue.StartTime != nil {
-		startToday := time.Date(time1.Year(), time1.Month(), time1.Day(), time1.Hour(), time1.Minute(), time1.Second(), 0, time.Local)
+		startToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StartTime.Hour(), queue.StartTime.Minute(), 0, 0, time.Local)
 		if now.Before(startToday) {
 			withinTimeWindow = false
 		}
 	}
 	if queue.StopTime != nil {
-		stopToday := time.Date(time2.Year(), time2.Month(), time2.Day(), time2.Hour(), time2.Minute(), time2.Second(), 0, time.Local)
+		stopToday := time.Date(now.Year(), now.Month(), now.Day(), queue.StopTime.Hour(), queue.StopTime.Minute(), 0, 0, time.Local)
 		if now.After(stopToday) {
 			withinTimeWindow = false
 		}
@@ -838,12 +883,12 @@ func controlQueueTasks(queue *DownloadQueue, withinTimeWindow bool) {
 
 func submitQueueTasks(queue *DownloadQueue, queuePool *WorkerPool, results chan<- DownloadStatus) {
 	for _, task := range queue.Tasks {
-		controlChan := make(chan ControlMessage, 1)
+		controlChan := make(chan ControlMessage, 10) // Larger buffer for queue commands
 		controlMux.Lock()
 		controlChans[task.ID] = controlChan
 		controlMux.Unlock()
 		queuePool.Submit(func() {
-			downloadFile(task, controlChan, results, queue.MaxRetries, queue)
+			downloadFile(task, controlChan, results, queue)
 			cleanupTask(task)
 		})
 	}
@@ -874,7 +919,6 @@ func cleanupTask(task DownloadTask) {
 	}
 }
 
-// ---- Helper Functions ----
 func updateProgress(status *DownloadStatus, filePath string, bytesDownloaded int, totalBytes int64, hasTotalBytes bool) {
 	progress := calculateProgress(bytesDownloaded, totalBytes, hasTotalBytes)
 	speed, eta := calculateSpeedAndETA(status.BytesInWindow, status.Timestamps, bytesDownloaded, totalBytes, hasTotalBytes)
@@ -910,7 +954,7 @@ func updateQueueTimeInterval(queueID int, startTime, stopTime *time.Time) {
 		queue.StopTime = stopTime
 		fmt.Printf("Updated time interval for Queue %d to Start: %s, Stop: %s\n",
 			queueID, startTime.Format("15:04"), stopTime.Format("15:04"))
-		checkQueueTimeWindow(queue) // Immediately apply
+		checkQueueTimeWindow(queue)
 	} else {
 		fmt.Printf("Queue %d not found\n", queueID)
 	}
@@ -929,7 +973,32 @@ func updateQueueRetries(queueID, retries int) {
 	}
 }
 
-// ---- Main and Setup Functions ----
+func setupDownloadQueues() []*DownloadQueue {
+	now := time.Now()
+	startTime1 := now
+	stopTime1 := now.Add(2 * time.Hour)
+	queuesList := []*DownloadQueue{
+		{
+			Tasks: []DownloadTask{
+				{ID: 1, URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
+				{ID: 2, URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
+				{ID: 3, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
+			},
+			SpeedLimit:       float64(totalBandwidthLimit),
+			ConcurrentLimit:  2,
+			StartTime:        &startTime1,
+			StopTime:         &stopTime1,
+			MaxRetries:       3,
+			ID:               1,
+			DownloadLocation: "C:/CustomDownloads",
+		},
+	}
+	for i := range queuesList {
+		setFileNames(queuesList[i].Tasks)
+		setFileType(queuesList[i].Tasks)
+	}
+	return queuesList
+}
 
 func startProgressDisplay(wg *sync.WaitGroup) {
 	wg.Add(1)
@@ -959,12 +1028,20 @@ func processCommand(input string, pool *WorkerPool) bool {
 	}
 	parts := strings.Split(input, " ")
 	if len(parts) < 2 {
-		fmt.Println("Invalid command. Use 'pause ID', 'resume ID', 'cancel ID', 'reset ID', 'speed QUEUE_ID KB_PER_SEC', 'settime QUEUE_ID START_HH:MM STOP_HH:MM', or 'setretries QUEUE_ID NUM'")
+		fmt.Println("Invalid command. Use 'pausequeue QUEUE_ID', 'resumequeue QUEUE_ID', 'cancelqueue QUEUE_ID', 'speed QUEUE_ID KB_PER_SEC', 'settime QUEUE_ID START_HH:MM STOP_HH:MM', 'setretries QUEUE_ID NUM', or 'task-specific commands'")
 		return true
 	}
 
 	action := parts[0]
 	switch action {
+	case "pausequeue", "resumequeue", "cancelqueue":
+		queueID, err := strconv.Atoi(parts[1])
+		if err != nil {
+			fmt.Println("Invalid queue ID. Must be a number.")
+			return true
+		}
+		action = strings.TrimPrefix(action, "queue")
+		sendQueueControlMessage(queueID, action)
 	case "speed":
 		if len(parts) != 3 {
 			fmt.Println("Invalid speed command. Use 'speed QUEUE_ID KB_PER_SEC' (e.g., 'speed 1 600')")
@@ -1015,7 +1092,7 @@ func processCommand(input string, pool *WorkerPool) bool {
 		updateQueueRetries(queueID, retries)
 	default:
 		if len(parts) != 2 {
-			fmt.Println("Invalid command. Use 'pause ID', 'resume ID', 'cancel ID', 'reset ID', 'speed QUEUE_ID KB_PER_SEC', 'settime QUEUE_ID START_HH:MM STOP_HH:MM', or 'setretries QUEUE_ID NUM'")
+			fmt.Println("Invalid command. Use 'pause ID', 'resume ID', 'cancel ID', 'reset ID', or queue commands")
 			return true
 		}
 		taskID, err := strconv.Atoi(parts[1])
@@ -1024,23 +1101,38 @@ func processCommand(input string, pool *WorkerPool) bool {
 			return true
 		}
 		if action != "pause" && action != "resume" && action != "cancel" && action != "reset" {
-			fmt.Println("Invalid action. Use 'pause', 'resume', 'cancel', 'reset', 'speed', 'settime', or 'setretries'.")
+			fmt.Println("Invalid action. Use 'pause', 'resume', 'cancel', 'reset', or queue commands.")
 			return true
 		}
-		sendControlMessage(taskID, action)
+		sendControlMessage(taskID, -1, action)
 	}
 	return true
 }
 
-func sendControlMessage(taskID int, action string) {
+func sendControlMessage(taskID, queueID int, action string) {
 	controlMux.Lock()
+	defer controlMux.Unlock()
 	if controlChan, ok := controlChans[taskID]; ok {
-		controlChan <- ControlMessage{TaskID: taskID, Action: action}
+		controlChan <- ControlMessage{TaskID: taskID, QueueID: queueID, Action: action}
 		fmt.Printf("%s command sent for task ID %d\n", action, taskID)
 	} else {
 		fmt.Printf("Task ID %d not found or already completed/canceled\n", taskID)
 	}
-	controlMux.Unlock()
+}
+
+func sendQueueControlMessage(queueID int, action string) {
+	controlMux.Lock()
+	defer controlMux.Unlock()
+	if queue, exists := queues[queueID]; exists {
+		for _, task := range queue.Tasks {
+			if controlChan, ok := controlChans[task.ID]; ok {
+				controlChan <- ControlMessage{TaskID: task.ID, QueueID: queueID, Action: action}
+			}
+		}
+		fmt.Printf("%s command sent for all tasks in Queue %d\n", action, queueID)
+	} else {
+		fmt.Printf("Queue %d not found\n", queueID)
+	}
 }
 
 func monitorDownloads(wg *sync.WaitGroup, results chan DownloadStatus, totalTasks int) {
@@ -1068,18 +1160,15 @@ func reportDownloadResult(result DownloadStatus) {
 	}
 }
 
-func applyHardcodedChanges() {
+func applyHardcodedSpeedChanges() {
 	go func() {
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 		updateQueueSpeedLimit(1, 600*1024)
-		fmt.Println("Queue 1 speed limit updated to 600 KB/s after 3 seconds")
+		fmt.Println("Queue 1 speed limit updated to 600 KB/s after 5 seconds")
 
 		time.Sleep(3 * time.Second)
-		now := time.Now()
-		startTime := now.Add(2 * time.Second)
-
-		stopTime := now.Add(10000 * time.Second)
-		updateQueueTimeInterval(1, &startTime, &stopTime)
+		startTime, stopTime, _ := parseTimeInterval("10:00", "12:00")
+		updateQueueTimeInterval(1, startTime, stopTime)
 		fmt.Println("Queue 1 time interval updated to 10:00-12:00 after 6 seconds")
 
 		time.Sleep(3 * time.Second)
@@ -1089,49 +1178,19 @@ func applyHardcodedChanges() {
 		time.Sleep(3 * time.Second)
 		updateQueueSpeedLimit(1, 700*1024)
 		fmt.Println("Queue 1 speed limit updated to 700 KB/s after 12 seconds")
-	}()
-}
 
-func setupDownloadQueues() []*DownloadQueue {
-	now := time.Now()
-	startTime1 := now
-	stopTime1 := now.Add(2 * time.Hour)
-	queuesList := []*DownloadQueue{
-		{
-			Tasks: []DownloadTask{
-				{ID: 1, URL: "https://dl.sevilmusics.com/cdn/music/srvrf/Sohrab%20Pakzad%20-%20Dokhtar%20Irooni%20[SevilMusic]%20[Remix].mp3"},
-				{ID: 2, URL: "https://dls.musics-fa.com/tagdl/downloads/Homayoun%20Shajarian%20-%20Chera%20Rafti%20(128).mp3"},
-				{ID: 3, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"}, // Additional link for testing
-				//{ID: 4, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
-				{ID: 4, URL: "https://example.com/file3.mp3"},
-			},
-			SpeedLimit:       float64(totalBandwidthLimit), // 500 KB/s
-			ConcurrentLimit:  2,
-			StartTime:        &startTime1,
-			StopTime:         &stopTime1,
-			MaxRetries:       2,
-			ID:               1,
-			DownloadLocation: "C:/CustomDownloads", // Example custom location
-		},
-		/*{
-			Tasks: []DownloadTask{
-				{ID: 6, URL: "https://soft1.downloadha.com/NarmAfzaar/June2020/Adobe.Photoshop.2020.v21.2.0.225.x64.Portable_www.Downloadha.com_.rar"},
-				{ID: 7, URL: "https://dl6.dlhas.ir/behnam/2020/January/Android/Temple-Run-2-1.64.0-Arm64_Downloadha.com_.apk"},
-			},
-			SpeedLimit:       float64(totalBandwidthLimit) * 0.4, // 200 KB/s
-			ConcurrentLimit:  2,
-			StartTime:        nil,
-			StopTime:         nil,
-			MaxRetries:       2,
-			ID:               2,
-			DownloadLocation: "D:/AnotherLocation", // Another example custom location
-		}*/
-	}
-	for i := range queuesList {
-		setFileNames(queuesList[i].Tasks)
-		setFileType(queuesList[i].Tasks)
-	}
-	return queuesList
+		time.Sleep(3 * time.Second)
+		sendQueueControlMessage(1, "resume")
+		fmt.Println("Queue 1 all tasks resumed after 15 seconds")
+
+		time.Sleep(3 * time.Second)
+		sendQueueControlMessage(1, "pause")
+		fmt.Println("Queue 1 all tasks paused after 18 seconds")
+
+		time.Sleep(3 * time.Second)
+		sendQueueControlMessage(1, "resume")
+		fmt.Println("Queue 1 all tasks resumed again after 21 seconds")
+	}()
 }
 
 func main() {
@@ -1156,7 +1215,7 @@ func main() {
 		totalTasks += len(q.Tasks)
 	}
 
-	applyHardcodedChanges()
+	applyHardcodedSpeedChanges()
 	monitorDownloads(&wg, results, totalTasks)
 
 	pool.StopWait()
@@ -1177,3 +1236,5 @@ func validateQueue(queue *DownloadQueue) error {
 	}
 	return nil
 }
+
+//TODO FIX
